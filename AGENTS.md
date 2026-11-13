@@ -11,6 +11,7 @@ Frontend (`web/`, Bun; CI pins bun 1.4.4):
 
 - `bun install` — install (lockfile `web/bun.lock` is committed; use `--frozen-lockfile` in CI)
 - `bun run lint` — oxlint; `bun run format:check` — Prettier (fix with `bun run format`); both enforced in CI
+- `bun run test` — Vitest (jsdom, app-root seam, co-located `src/**/*.test.tsx`); enforced in CI
 - `bun run build` — typecheck + production build into `web/dist`
 - `bun run dev` — Vite dev server on :5173, proxies `/api` to 127.0.0.1:8080
 

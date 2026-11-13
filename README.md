@@ -29,6 +29,7 @@ bun install           # install dependencies (bun.lock committed)
 bun run dev           # Vite dev server on :5173, proxies /api to 127.0.0.1:8080
 bun run build         # typecheck + production build into web/dist (embedded by cargo build --release)
 bun run lint          # oxlint (template default)
+bun run test          # Vitest (jsdom, app-root seam)
 bun run format:check  # Prettier check (CI enforces; bun run format to fix)
 ```
 
@@ -36,7 +37,7 @@ For full-stack development run `cargo run` and `bun run dev` side by side and op
 
 SPA-serving Rust tests skip when `web/dist` has not been built; run `bun run build` first to exercise them locally.
 
-CI (`.github/workflows/ci.yml`) runs the Rust lint job, a frontend job (frozen install, lint, format check, build) and the test job — the test job consumes the frontend build output so SPA serving is tested for real.
+CI (`.github/workflows/ci.yml`) runs the Rust lint job, a frontend job (frozen install, lint, format check, test, build) and the test job — the test job consumes the frontend build output so SPA serving is tested for real.
 
 ## Releases
 
