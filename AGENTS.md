@@ -1,5 +1,14 @@
 # AGENTS.md
 
+## Development
+
+- `cargo fmt` — format (CI enforces `cargo fmt --check`)
+- `cargo clippy --locked --all-targets` — lints; CI runs with `RUSTFLAGS: -Dwarnings`, so warnings fail the build
+- `cargo test --locked` — full suite (unit + HTTP integration tests)
+- `cargo run` — start the API server on `0.0.0.0:8080`
+
+All HTTP behavior is tested through the in-process router seam (see `tests/`); tests must not open real sockets.
+
 ## Agent skills
 
 ### Issue tracker
