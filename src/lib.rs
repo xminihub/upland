@@ -24,7 +24,7 @@ mod tests {
     use axum_test::TestServer;
 
     #[tokio::test]
-    async fn router_constructs_with_only_the_known_routes() {
+    async fn unknown_paths_are_not_found() {
         let server = TestServer::new(router());
         server
             .get("/nope")

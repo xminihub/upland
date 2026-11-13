@@ -2,7 +2,7 @@ use axum_test::TestServer;
 use serde_json::{Value, json};
 
 #[tokio::test]
-async fn visitor_receives_hello_at_root() {
+async fn api_consumer_receives_hello_at_root() {
     let server = TestServer::new(upland::router());
     let response = server.get("/").await;
 

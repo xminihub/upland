@@ -13,9 +13,9 @@ The server listens on `0.0.0.0:8080` by default.
 
 ```sh
 cargo run             # start the server on 0.0.0.0:8080
-cargo test            # unit tests + HTTP integration tests (axum-test, in-process)
-cargo fmt             # format
-cargo clippy --all-targets  # lints (CI denies warnings)
+cargo test --locked     # unit tests + HTTP integration tests (axum-test, in-process)
+cargo fmt --check     # format
+cargo clippy --locked --all-targets  # lints (CI denies warnings)
 ```
 
 CI (`.github/workflows/ci.yml`) runs lint (fmt/check/clippy) and tests on every push to `main`.
