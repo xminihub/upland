@@ -25,8 +25,10 @@ Distribution (`scripts/`, shell + jq):
 - `scripts/asset-name.sh` — the only place an asset name is spelled
 - `scripts/package-brew-tarball.sh` — one deterministic tarball per Homebrew target; needs GNU tar (`brew install gnu-tar`, then `TAR=gtar`)
 - `scripts/install-musl-toolchain.sh` — pins and installs zig and `cargo-zigbuild`, the C toolchain the two `*-musl` targets build the bundled SQLite and link with; `release.yml` runs it before those builds
+- `scripts/install.sh` — the **installer** (ADR-0006): POSIX sh, Linux/macOS, checksum-verified, installs to `~/.local/bin`; shipped byte-for-byte as the versionless `install.sh` release asset and deliberately ungated by CI — its first run against real assets is its first test
 - `bash scripts/test-package-brew-tarball.sh` — the packaging contract, asserted; CI's `packaging` job runs it on Ubuntu, and it is deliberately not a `cargo test`
-- `Formula/upland.rb` and the Ruby template live in `xminihub/homebrew-tap`, not here; the release dispatches that repository's `bump.yml` and waits for it (ADR-0001)
+- `Formula/upland.rb` and the Ruby template live in `xminihub/homebrew-tap`, not here; the release dispatches that repository's `bump.yml` and waits for it (ADR-0001). The tap's upland seed files (`tools/upland.json`, `templates/upland.rb.tpl`) were onboarded per ADR-0006
+- The release chain reads as the channel priority: `github-release → tap → cargo`. The cargo job stages the `web-dist` artifact into `web/dist`, asserts the crate listing, and publishes with the `CARGO_REGISTRY_TOKEN` secret (publish-only, must exist before the first release carrying this job); an already-published version is skipped, not failed — registry versions are one-shot (ADR-0006)
 
 ## Agent skills
 

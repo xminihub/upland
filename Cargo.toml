@@ -2,9 +2,28 @@
 name = "upland"
 version = "0.1.5"
 edition = "2024"
+rust-version = "1.87" # edition 2024 needs 1.85; the code's newest stable std API (is_multiple_of) needs 1.87
 description = "HTTP API server with an embedded web UI"
-license-file = "LICENSE"
+license = "MIT"
 repository = "https://github.com/xminihub/upland"
+keywords = ["http", "server", "api", "axum", "sqlite"]
+categories = ["web-programming::http-server"]
+# The cargo channel ships the same bytes every release asset embeds (ADR-0006).
+# `include` is a whitelist whose documented precedence over .gitignore is what
+# pulls the built SPA bundle into the crate; the release pipeline stages that
+# build before packaging, and its own gate re-lists this every release. Without
+# the staged bundle the channel still compiles — build.rs yields an empty embed
+# folder — so the listing assertion, not the build, is what catches a mistake.
+include = [
+  "/src",
+  "/web/dist",
+  "/migrations",
+  "/.sqlx",
+  "/.env",
+  "/build.rs",
+  "/LICENSE",
+  "/README.md",
+]
 
 [[bin]]
 name = "upland"

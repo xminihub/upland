@@ -92,6 +92,21 @@ jobs:
           cargo clippy --locked --all-targets
           cargo test --locked --all-targets
 
+      # The crate must ship what every other channel ships: the SPA bundle
+      # staged by the frontend build above, the migrations, and the offline
+      # query metadata. Asserted before the bump because a red release must
+      # leave no version to explain (ADR-0006).
+      - name: Assert the crate packaging
+        run: |
+          set -euo pipefail
+          listing="$(cargo package --list --allow-dirty)"
+          for want in web/dist/index.html migrations/ .sqlx/; do
+            printf '%s\n' "$listing" | grep -qF "$want" || {
+              echo "the packaged crate does not carry $want"
+              exit 1
+            }
+          done
+
   release:
     name: Bump & Tag
     runs-on: ubuntu-latest
@@ -283,6 +298,17 @@ jobs:
           done < <(jq -sr '.[] | [.asset, .path, .sha256] | @tsv' dist/manifest.jsonl)
           ls -la dist/assets
 
+      # The installer ships versionless, byte-for-byte from scripts/install.sh:
+      # `releases/latest/download/install.sh` is a URL that never changes, and
+      # the repo copy is the source a user can read before piping it
+      # (ADR-0006). It is not in SHA256SUMS and not in the manifest — the
+      # checksum manifest names the bytes a channel installs, and the script
+      # is transport, not artifact — so the count guard above stays exact.
+      - name: Attach the installer asset
+        run: |
+          set -euo pipefail
+          cp scripts/install.sh dist/assets/install.sh
+
       - uses: actions/upload-artifact@v4
         with:
           name: release-assets
@@ -386,3 +412,61 @@ jobs:
             echo "::error::Formula/$TOOL.rb pins ${pinned:-nothing}, not $VERSION (bump run $concluded: https://github.com/$TAP_REPO/actions/runs/${{ steps.dispatch.outputs.run_id }})"
             exit 1
           fi
+
+  cargo:
+    name: Publish crate
+    needs: [release, tap]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.release.outputs.version }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # One build feeds every channel (ADR-0001), and the cargo channel is
+      # no exception: the same web-dist artifact the darwin, Linux and
+      # Windows binaries embed is staged here before packaging, so the crate
+      # never ships the UI-less tree build.rs would otherwise create.
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
+      # verify asserted this listing before the bump; it is asserted again
+      # because republishing assets is legal and republishing a registry
+      # version is not — a half-packed crate is the one mistake this
+      # pipeline could not undo (ADR-0006).
+      - name: Assert the crate packaging
+        run: |
+          set -euo pipefail
+          listing="$(cargo package --list --allow-dirty)"
+          for want in web/dist/index.html migrations/ .sqlx/; do
+            printf '%s\n' "$listing" | grep -qF "$want" || {
+              echo "the packaged crate does not carry $want"
+              exit 1
+            }
+          done
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "::error::the CARGO_REGISTRY_TOKEN secret is not configured; the cargo channel cannot publish"
+            exit 1
+          fi
+          # Already-published is a skip, not a failure: this pipeline's
+          # repair contract is re-dispatch, and a re-dispatch cannot un- or
+          # re-publish a registry version. The sparse index answers; a missing
+          # crate answers as nothing-published, which is the first release.
+          index="$(curl -fsS https://index.crates.io/up/la/upland || true)"
+          published="$(printf '%s' "$index" | jq -es --arg v "$VERSION" 'any(.[]; .vers == $v)')"
+          if [ "$published" = "true" ]; then
+            echo "::notice::upland $VERSION is already on crates.io — publish skipped"
+          else
+            cargo publish --locked --allow-dirty
+          fi
+

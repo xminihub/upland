@@ -83,7 +83,10 @@ names code, issues, tests, workflows and ADRs must use.
 - **brew target** — the **target** subset a formula covers: the four non-Windows
   targets. `win32-x64` is never a brew target; Homebrew has no Windows.
 - **release asset** — a file attached to a GitHub Release: one **tarball asset**
-  per **brew target**, `upland-<version>-win32-x64.exe`, and `SHA256SUMS`.
+  per **brew target**, `upland-<version>-win32-x64.exe`, `SHA256SUMS`, and the
+  **installer**'s byte-identical versionless copy `install.sh` — transport,
+  not artifact, so it is the one release asset the **checksum manifest** does
+  not name.
 - **checksum manifest** — `SHA256SUMS`, listing the sha256 of every published
   asset, sorted by file name, as `<hash>  <file>` lines. It names the exact
   bytes a channel installed.
@@ -98,13 +101,41 @@ names code, issues, tests, workflows and ADRs must use.
 
 ## Channels
 
-- **channel** — a way to install and run upland. **Homebrew** is the documented
-  one; a **release asset** downloaded by hand is the other. There is no
-  installer script, no npm package and no container image (ADR-0001).
+- **channel** — a way to install and run upland. Three, documented in this
+  order (ADR-0006): the **binary channel** first — the **installer** on Linux
+  and macOS, the **release assets** everywhere including Windows;
+  **Homebrew** second, framed for macOS although the **formula** covers every
+  **brew target**; the **cargo channel** third. The order is install order,
+  not leniency: every channel gate is hard. There is still no npm package and
+  no container image (ADR-0001).
+- **binary channel** — the GitHub **release assets** and the **installer**
+  that scripts them: the primary channel, and the only one that was ever
+  actually published before ADR-0006.
+- **installer** — `scripts/install.sh`: the POSIX **sh** program that maps
+  `uname` onto a **target**, resolves a release (pinned by `UPLAND_VERSION`,
+  else `latest` via one redirect), verifies the **tarball asset** against the
+  **checksum manifest**, and installs to `~/.local/bin` without elevating.
+  Attached to every release verbatim as the versionless `install.sh` asset —
+  the stable URL beside version-named artifacts. Deliberately ungated by CI
+  (ADR-0006): read it before piping it; that is its contract.
+- **cargo channel** — `cargo install upland`: the **crate** published to
+  crates.io as the release's last job. The crate carries the **SPA bundle**
+  (the same `web-dist` build every other artifact embeds), the migrations,
+  and the offline query metadata, so it compiles with no bun, node, or
+  database service. Registry versions are one-shot: unlike **republishing**
+  an asset, a published version is forever; the pipeline answers a
+  re-dispatch with skip, never fail.
+- **crate** — the package `cargo publish` sends to crates.io: sources,
+  migrations, offline query metadata, and the **SPA bundle** staged by the
+  same release that shipped it. Distinct from the **binary**: the crate is
+  the program as source, built on the user's machine, published under a
+  version that cannot be republished.
 - **tap** — what Homebrew calls `xminihub/tap`, i.e. `brew tap xminihub/tap`.
   Its Git repository is not this one: it is `xminihub/homebrew-tap`, the
   org-wide tap shared by every xminihub tool. upland has never owned a tap of
-  its own.
+  its own. Registration in the tap lives in two seed files there
+  (`tools/upland.json`, `templates/upland.rb.tpl`), pushed when ADR-0006
+  onboarded upland — until then every release reddened at the **bump**.
 - **formula** — `Formula/upland.rb` in the tap. Generated, never hand-written
   here: the source of truth is `tools/upland.json` plus
   `templates/upland.rb.tpl` in the tap, rendered and verified by that
