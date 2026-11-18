@@ -1,6 +1,7 @@
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+import { OIDC_PENDING_KEY } from "@/lib/oidc";
 import { setToken } from "@/lib/session";
 import { renderApp } from "@/test/harness";
 
@@ -39,6 +40,7 @@ async function submit(buttonName: string) {
 
 beforeEach(() => {
   localStorage.clear();
+  sessionStorage.clear();
   vi.unstubAllGlobals();
 });
 
@@ -253,5 +255,155 @@ describe("Unknown routes", () => {
 
     expect(await screen.findByText("Page not found")).toBeInTheDocument();
     expect(screen.getByRole("banner")).toHaveTextContent("Upland");
+  });
+});
+
+// The OIDC door (#25): provider buttons, the hand-rolled PKCE module,
+// and the callback that trades the code for an upland token.
+
+function stubCrypto() {
+  vi.stubGlobal("crypto", {
+    getRandomValues: (array: Uint8Array) => {
+      for (let i = 0; i < array.length; i++) array[i] = i + 1;
+      return array;
+    },
+    subtle: {
+      digest: async () => new Uint8Array([1, 2, 3]).buffer,
+    },
+  });
+}
+
+const PROVIDERS = [
+  {
+    name: "work",
+    issuer: "https://issuer.test/realms/main",
+    client_id: "upland-work",
+  },
+];
+
+describe("OIDC sign-in", () => {
+  it("offers one button per configured provider", async () => {
+    stubCrypto();
+    mockApi({
+      "/api/v1/auth/providers": () => Response.json(PROVIDERS),
+    });
+    renderApp("/login");
+    await screen.findByLabelText("Username");
+
+    expect(
+      await screen.findByRole("button", { name: "Sign in with work" }),
+    ).toBeInTheDocument();
+  });
+
+  it("hides the door entirely when no provider is configured", async () => {
+    mockApi({
+      "/api/v1/auth/providers": () => Response.json([]),
+    });
+    renderApp("/login");
+    await screen.findByLabelText("Username");
+
+    expect(
+      screen.queryByRole("button", { name: /Sign in with/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("starts PKCE against the issuer and hands the browser over", async () => {
+    stubCrypto();
+    const assign = vi.fn();
+    vi.stubGlobal("location", { origin: "http://localhost", assign });
+    mockApi({
+      "/api/v1/auth/providers": () => Response.json(PROVIDERS),
+      "/.well-known/openid-configuration": () =>
+        Response.json({
+          authorization_endpoint: "https://issuer.test/authorize",
+          token_endpoint: "http://localhost/token",
+        }),
+    });
+    renderApp("/login");
+    await screen.findByLabelText("Username");
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Sign in with work" }),
+    );
+
+    await waitFor(() => expect(assign).toHaveBeenCalled());
+    const url = new URL(assign.mock.calls[0][0]);
+    expect(url.origin + url.pathname).toBe("https://issuer.test/authorize");
+    expect(url.searchParams.get("response_type")).toBe("code");
+    expect(url.searchParams.get("code_challenge_method")).toBe("S256");
+    expect(url.searchParams.get("code_challenge")).toBe("AQID");
+    expect(url.searchParams.get("scope")).toBe("openid email");
+    expect(url.searchParams.get("redirect_uri")).toBe(
+      "http://localhost/oauth/callback",
+    );
+    expect(url.searchParams.get("state")).toBeTruthy();
+    expect(sessionStorage.getItem(OIDC_PENDING_KEY)).toContain("verifier");
+  });
+
+  it("trades the callback code for an upland token", async () => {
+    vi.stubGlobal("location", { origin: "http://localhost", assign: vi.fn() });
+    sessionStorage.setItem(
+      OIDC_PENDING_KEY,
+      JSON.stringify({
+        provider: "work",
+        state: "GOODSTATE",
+        verifier: "the-verifier",
+        nonce: "the-nonce",
+        token_endpoint: "http://localhost/token",
+        client_id: "upland-work",
+      }),
+    );
+    mockApi({
+      "/token": () =>
+        Response.json({ id_token: "ID-TOKEN", token_type: "Bearer" }),
+      "/api/v1/auth/oidc": () => Response.json({ access_token: "AT" }),
+      "/api/v1/hello": () => Response.json({ message: "Hello from upland!" }),
+      "/api/v1/auth/me": () =>
+        Response.json({
+          id: 1,
+          username: "tess",
+          email: "tess@example.com",
+          identities: ["work"],
+        }),
+    });
+    renderApp("/oauth/callback?code=THECODE&state=GOODSTATE");
+
+    expect(await screen.findByText("Hello from upland!")).toBeInTheDocument();
+    expect(localStorage.getItem("upland_token")).toBe("AT");
+    expect(sessionStorage.getItem(OIDC_PENDING_KEY)).toBeNull();
+  });
+
+  it("refuses a state that does not match the sign-in started", async () => {
+    vi.stubGlobal("location", { origin: "http://localhost", assign: vi.fn() });
+    sessionStorage.setItem(
+      OIDC_PENDING_KEY,
+      JSON.stringify({
+        provider: "work",
+        state: "GOODSTATE",
+        verifier: "the-verifier",
+        nonce: "the-nonce",
+        token_endpoint: "http://localhost/token",
+        client_id: "upland-work",
+      }),
+    );
+    mockApi({});
+    renderApp("/oauth/callback?code=THECODE&state=WRONGSTATE");
+
+    expect(
+      await screen.findByText(
+        "The provider's response did not match the sign-in you started.",
+      ),
+    ).toBeInTheDocument();
+    expect(localStorage.getItem("upland_token")).toBeNull();
+  });
+
+  it("reports a provider refusal by name on the login screen", async () => {
+    vi.stubGlobal("location", { origin: "http://localhost", assign: vi.fn() });
+    mockApi({});
+    renderApp("/oauth/callback?error=access_denied&state=GOODSTATE");
+
+    expect(
+      await screen.findByText("The provider refused the sign-in."),
+    ).toBeInTheDocument();
   });
 });
