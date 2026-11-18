@@ -1,6 +1,6 @@
 [package]
 name = "upland"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "HTTP API server with an embedded web UI"
 license-file = "LICENSE"
