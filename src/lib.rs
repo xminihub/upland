@@ -11,8 +11,10 @@ use axum::routing::get;
 use rust_embed::RustEmbed;
 use serde_json::{Value, json};
 
+pub mod auth;
 pub mod db;
 
+use auth::SigningSecret;
 use db::Db;
 
 #[derive(RustEmbed)]
@@ -91,6 +93,25 @@ pub struct Config {
     /// The **config path** (CONTEXT.md, ADR-0005): where the **config file**
     /// was read from, defaulting beside the **database path**.
     pub config_path: PathBuf,
+    /// The **signing secret** (ADR-0004): mints and verifies every
+    /// **access token**. Generated on first boot, operator-owned after.
+    pub signing_secret: SigningSecret,
+    /// The **access token** lifetime in seconds (ADR-0004), 86400 unless
+    /// the **config file** says otherwise.
+    pub ttl_seconds: u64,
+    /// The configured **provider**s (ADR-0005): parsed strictly,
+    /// validated and served by the OIDC feature.
+    pub oidc_providers: Vec<OidcProvider>,
+}
+
+pub const DEFAULT_TTL_SECONDS: u64 = 86400;
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OidcProvider {
+    pub name: String,
+    pub issuer: String,
+    pub client_id: String,
 }
 
 /// The per-user data directory a platform expects a server's state in. No
@@ -129,14 +150,49 @@ fn default_config_path(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf,
 struct FileConfig {
     #[serde(default)]
     server: FileServer,
+    #[serde(default)]
+    auth: FileAuth,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileServer {
     host: Option<String>,
-    port: Option<u16>,
+    port: Option<u64>,
     db_path: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileAuth {
+    jwt_secret: Option<String>,
+    ttl_seconds: Option<u64>,
+    #[serde(default)]
+    oidc_providers: Vec<OidcProvider>,
+}
+
+/// The document a first boot leaves behind (ADR-0005): every default
+/// spelled out, the **signing secret** generated, so the file an operator
+/// edits is the file the server read.
+fn default_config_document(
+    env: &impl Fn(&str) -> Option<String>,
+    secret: &str,
+) -> Result<String, String> {
+    let document = serde_json::json!({
+        "server": {
+            "host": DEFAULT_HOST,
+            "port": DEFAULT_PORT,
+            "db_path": default_db_path(env)?.display().to_string(),
+        },
+        "auth": {
+            "jwt_secret": secret,
+            "ttl_seconds": DEFAULT_TTL_SECONDS,
+            "oidc_providers": [],
+        },
+    });
+    serde_json::to_string_pretty(&document)
+        .map(|text| format!("{text}\n"))
+        .map_err(|error| error.to_string())
 }
 
 fn read_config_file(path: &Path) -> Result<Option<String>, String> {
@@ -148,6 +204,46 @@ fn read_config_file(path: &Path) -> Result<Option<String>, String> {
             path.display()
         )),
     }
+}
+
+fn create_config_file(path: &Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent().filter(|dir| !dir.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        // A racing boot won and wrote its own secret; the re-read below
+        // resolves both servers onto the same file.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "cannot create config file {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    use std::io::Write;
+    file.write_all(contents.as_bytes())
+        .map_err(|error| format!("cannot write config file {}: {error}", path.display()))
+}
+
+/// The storage seam (ADR-0005): `read_or_create(path, None)` reads;
+/// `read_or_create(path, Some(contents))` creates exclusively when
+/// absent and answers whatever the file now holds — the generated text
+/// or a racing boot's.
+fn read_or_create_config_file(path: &Path, write: Option<&str>) -> Result<Option<String>, String> {
+    if let Some(contents) = write {
+        create_config_file(path, contents)?;
+    }
+    read_config_file(path)
 }
 
 fn parse_file_config(path: &Path, contents: &str) -> Result<FileConfig, String> {
@@ -203,16 +299,12 @@ fn flag_value<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a St
         .ok_or_else(|| format!("{name} requires a value"))
 }
 
-fn bind_and_storage<I, S, E, R>(
-    args: I,
-    env: &E,
-    read: &R,
-) -> Result<(String, u16, PathBuf, PathBuf), String>
+fn bind_and_storage<I, S, E, R>(args: I, env: &E, storage: &R) -> Result<Config, String>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
     E: Fn(&str) -> Option<String>,
-    R: Fn(&Path) -> Result<Option<String>, String>,
+    R: Fn(&Path, Option<&str>) -> Result<Option<String>, String>,
 {
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
     let mut host: Option<String> = None;
@@ -259,14 +351,21 @@ where
         Some(value) => PathBuf::from(value),
         None => default_config_path(env)?,
     };
-    let contents = read(&config_path)?;
-    if contents.is_none() && explicit {
-        return Err(format!("config file not found: {}", config_path.display()));
-    }
-    let file = match contents {
-        Some(contents) => parse_file_config(&config_path, &contents)?,
-        None => FileConfig::default(),
+    let contents = match storage(&config_path, None)? {
+        Some(contents) => contents,
+        None => {
+            if explicit {
+                return Err(format!("config file not found: {}", config_path.display()));
+            }
+            // ADR-0005: a default location that has never held a file gets
+            // one, secret included. A racing boot's file wins the exclusive
+            // create; the re-read resolves both servers onto the same one.
+            let generated = default_config_document(env, &SigningSecret::random().hex())?;
+            storage(&config_path, Some(&generated))?
+                .ok_or_else(|| format!("cannot create config file {}", config_path.display()))?
+        }
     };
+    let file = parse_file_config(&config_path, &contents)?;
     let server = file.server;
 
     // Precedence (ADR-0005): flag > environment > file > built-in default,
@@ -286,7 +385,11 @@ where
         Some(port) => port,
         None => match env("UPLAND_PORT") {
             Some(value) => parse_port(&value)?,
-            None => server.port.unwrap_or(DEFAULT_PORT),
+            None => match server.port {
+                Some(port) => parse_port(&port.to_string())
+                    .map_err(|error| format!("config file server.port: {error}"))?,
+                None => DEFAULT_PORT,
+            },
         },
     };
     // An empty UPLAND_DB_PATH is a failure rather than a nudge back to the
@@ -301,7 +404,39 @@ where
         None => default_db_path(env)?,
     };
 
-    Ok((host, port, db_path, config_path))
+    // ADR-0004: the signing secret is generated on first boot and
+    // operator-owned afterwards. A file that exists without one is a
+    // half-written promise, and half a door is worse than none.
+    let signing_secret = match file.auth.jwt_secret.as_deref() {
+        None => Err(
+            "config file auth.jwt_secret is missing: the signing secret every access token is minted with".to_owned()
+        ),
+        Some(value) if value.trim().is_empty() => Err(
+            "config file auth.jwt_secret is empty: the signing secret every access token is minted with".to_owned()
+        ),
+        Some(value) => {
+            SigningSecret::from_hex(value).map_err(|error| {
+                format!("config file auth.jwt_secret: {error}")
+            })
+        }
+    }?;
+    let ttl_seconds = match file.auth.ttl_seconds {
+        Some(0) => {
+            return Err("config file auth.ttl_seconds must not be zero".to_owned());
+        }
+        Some(ttl_seconds) => ttl_seconds,
+        None => DEFAULT_TTL_SECONDS,
+    };
+
+    Ok(Config {
+        host,
+        port,
+        db_path,
+        config_path,
+        signing_secret,
+        ttl_seconds,
+        oidc_providers: file.auth.oidc_providers,
+    })
 }
 
 impl Config {
@@ -323,26 +458,20 @@ impl Config {
         S: Into<String>,
         E: Fn(&str) -> Option<String>,
     {
-        Self::from_args_with(args, env, read_config_file)
+        Self::from_args_with(args, env, read_or_create_config_file)
     }
 
-    /// The same resolution with the file read injected, so the precedence
-    /// of flag, environment and **config file** is testable without ever
-    /// touching a real disk.
-    pub fn from_args_with<I, S, E, R>(args: I, env: E, read: R) -> Result<Self, String>
+    /// The same resolution with file access injected — reads and the
+    /// first-boot create — so the whole boot story of the **config file**
+    /// is testable without touching a real disk.
+    pub fn from_args_with<I, S, E, R>(args: I, env: E, storage: R) -> Result<Self, String>
     where
         I: IntoIterator<Item = S>,
         S: Into<String>,
         E: Fn(&str) -> Option<String>,
-        R: Fn(&Path) -> Result<Option<String>, String>,
+        R: Fn(&Path, Option<&str>) -> Result<Option<String>, String>,
     {
-        let (host, port, db_path, config_path) = bind_and_storage(args, &env, &read)?;
-        Ok(Self {
-            host,
-            port,
-            db_path,
-            config_path,
-        })
+        bind_and_storage(args, &env, &storage)
     }
 }
 
@@ -352,6 +481,18 @@ where
     S: Into<String>,
     E: Fn(&str) -> Option<String>,
 {
+    parse_args_with(args, env, read_or_create_config_file)
+}
+
+/// The same decision with file access injected, so the boot story is
+/// testable without a real disk.
+pub fn parse_args_with<I, S, E, R>(args: I, env: E, storage: R) -> Result<Invocation, String>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+    E: Fn(&str) -> Option<String>,
+    R: Fn(&Path, Option<&str>) -> Result<Option<String>, String>,
+{
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
     if args.iter().any(|arg| arg == "--version" || arg == "-V") {
         return Ok(Invocation::Version);
@@ -359,7 +500,7 @@ where
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
         return Ok(Invocation::Help);
     }
-    Config::from_args(args, &env).map(Invocation::Serve)
+    Config::from_args_with(args, env, storage).map(Invocation::Serve)
 }
 
 #[cfg(test)]
@@ -385,7 +526,8 @@ mod tests {
     fn no_arguments_bind_loopback_on_the_default_port() {
         // A brew service and a laptop both start with nothing on the command
         // line: what they must not get is a port open on the network.
-        let config = crate::Config::from_args(Vec::<String>::new(), env(&[])).expect("defaults");
+        let config = crate::Config::from_args_with(Vec::<String>::new(), env(&[]), fs(&[]))
+            .expect("defaults");
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 8080);
         // The default database path is a per-user location, not the working
@@ -405,16 +547,18 @@ mod tests {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let expected = std::path::Path::new("/home/tester/.local/share/upland/upland.db");
 
-        let config = crate::Config::from_args(Vec::<String>::new(), env(&[])).expect("defaults");
+        let config = crate::Config::from_args_with(Vec::<String>::new(), env(&[]), fs(&[]))
+            .expect("defaults");
         assert_eq!(config.db_path, expected);
     }
 
     #[test]
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn xdg_data_home_wins_over_the_local_share_fallback() {
-        let config = crate::Config::from_args(
+        let config = crate::Config::from_args_with(
             Vec::<String>::new(),
             env(&[("XDG_DATA_HOME", "/srv/upland-data")]),
+            fs(&[]),
         )
         .expect("xdg");
         assert_eq!(
@@ -425,16 +569,18 @@ mod tests {
 
     #[test]
     fn the_database_path_flag_and_environment_are_honoured() {
-        let from_flag = crate::Config::from_args(
+        let from_flag = crate::Config::from_args_with(
             vec!["--db-path".to_string(), "/tmp/flag.db".to_string()],
             env(&[("UPLAND_DB_PATH", "/tmp/env.db")]),
+            fs(&[]),
         )
         .expect("flag");
         assert_eq!(from_flag.db_path, std::path::Path::new("/tmp/flag.db"));
 
-        let from_env = crate::Config::from_args(
+        let from_env = crate::Config::from_args_with(
             Vec::<String>::new(),
             env(&[("UPLAND_DB_PATH", "/tmp/env.db")]),
+            fs(&[]),
         )
         .expect("env");
         assert_eq!(from_env.db_path, std::path::Path::new("/tmp/env.db"));
@@ -442,14 +588,18 @@ mod tests {
         // An empty UPLAND_DB_PATH is a failure, not a quiet default: the
         // operator wrote a path here and losing it silently is how the wrong
         // database gets opened.
-        let error = crate::Config::from_args(Vec::<String>::new(), env(&[("UPLAND_DB_PATH", "")]))
-            .expect_err("must fail");
+        let error = crate::Config::from_args_with(
+            Vec::<String>::new(),
+            env(&[("UPLAND_DB_PATH", "")]),
+            fs(&[]),
+        )
+        .expect_err("must fail");
         assert!(error.contains("database path"), "{error}");
     }
 
     #[test]
     fn host_and_port_flags_are_honoured() {
-        let config = crate::Config::from_args(
+        let config = crate::Config::from_args_with(
             vec![
                 "--host".to_string(),
                 "0.0.0.0".to_string(),
@@ -457,6 +607,7 @@ mod tests {
                 "9000".to_string(),
             ],
             env(&[]),
+            fs(&[]),
         )
         .expect("flags");
         assert_eq!(config.host, "0.0.0.0");
@@ -465,7 +616,7 @@ mod tests {
 
     #[test]
     fn flags_come_before_the_order_they_are_written_in() {
-        let config = crate::Config::from_args(
+        let config = crate::Config::from_args_with(
             vec![
                 "--port".to_string(),
                 "9001".to_string(),
@@ -473,6 +624,7 @@ mod tests {
                 "::1".to_string(),
             ],
             env(&[]),
+            fs(&[]),
         )
         .expect("flags");
         assert_eq!(config.host, "::1");
@@ -481,9 +633,10 @@ mod tests {
 
     #[test]
     fn environment_variables_apply_when_the_flags_are_absent() {
-        let config = crate::Config::from_args(
+        let config = crate::Config::from_args_with(
             Vec::<String>::new(),
             env(&[("UPLAND_HOST", "0.0.0.0"), ("UPLAND_PORT", "9100")]),
+            fs(&[]),
         )
         .expect("env");
         assert_eq!(config.host, "0.0.0.0");
@@ -492,9 +645,10 @@ mod tests {
 
     #[test]
     fn a_flag_wins_over_the_environment_variable_it_disagrees_with() {
-        let config = crate::Config::from_args(
+        let config = crate::Config::from_args_with(
             vec!["--port".to_string(), "7000".to_string()],
             env(&[("UPLAND_HOST", "0.0.0.0"), ("UPLAND_PORT", "9100")]),
+            fs(&[]),
         )
         .expect("flag beats env");
         assert_eq!(config.port, 7000);
@@ -504,9 +658,12 @@ mod tests {
     #[test]
     fn an_unusable_port_is_a_failure_and_not_a_default() {
         for port in ["not-a-number", "0", "65536"] {
-            let error =
-                crate::Config::from_args(vec!["--port".to_string(), port.to_string()], env(&[]))
-                    .expect_err("must fail");
+            let error = crate::Config::from_args_with(
+                vec!["--port".to_string(), port.to_string()],
+                env(&[]),
+                fs(&[]),
+            )
+            .expect_err("must fail");
             assert!(error.contains("port"), "{port} produced {error}");
         }
     }
@@ -518,9 +675,12 @@ mod tests {
         // a server on the default port: the operator would read their own
         // plist, see the value they wrote, and believe it was in use.
         for value in ["http", "0", "65536", ""] {
-            let error =
-                crate::Config::from_args(Vec::<String>::new(), env(&[("UPLAND_PORT", value)]))
-                    .expect_err("must fail");
+            let error = crate::Config::from_args_with(
+                Vec::<String>::new(),
+                env(&[("UPLAND_PORT", value)]),
+                fs(&[]),
+            )
+            .expect_err("must fail");
             assert!(error.contains("port"), "{value} produced {error}");
         }
     }
@@ -529,7 +689,7 @@ mod tests {
     fn an_ipv6_listen_address_is_bracketed() {
         // "::1:8080" is itself a legal IPv6 literal meaning something else, so
         // an unbracketed IPv6 host would bind an address nobody wrote down.
-        let config = crate::Config::from_args(
+        let config = crate::Config::from_args_with(
             vec![
                 "--host".to_string(),
                 "::1".to_string(),
@@ -537,13 +697,17 @@ mod tests {
                 "9100".to_string(),
             ],
             env(&[]),
+            fs(&[]),
         )
         .expect("ipv6 loopback");
         assert_eq!(config.listen_address(), "[::1]:9100");
 
-        let ipv4 =
-            crate::Config::from_args(Vec::<String>::new(), env(&[("UPLAND_HOST", "0.0.0.0")]))
-                .expect("ipv4");
+        let ipv4 = crate::Config::from_args_with(
+            Vec::<String>::new(),
+            env(&[("UPLAND_HOST", "0.0.0.0")]),
+            fs(&[]),
+        )
+        .expect("ipv4");
         assert_eq!(ipv4.listen_address(), "0.0.0.0:8080");
     }
 
@@ -559,28 +723,39 @@ mod tests {
             ],
             vec!["--port".to_string(), "".to_string()],
         ] {
-            let error = crate::Config::from_args(args.clone(), env(&[])).expect_err("must fail");
+            let error = crate::Config::from_args_with(args.clone(), env(&[]), fs(&[]))
+                .expect_err("must fail");
             assert!(!error.is_empty(), "{args:?} produced no message");
         }
     }
 
     #[test]
     fn an_unknown_option_is_a_failure_naming_it() {
-        let error =
-            crate::Config::from_args(vec!["--addr".to_string(), "0.0.0.0".to_string()], env(&[]))
-                .expect_err("must fail");
+        let error = crate::Config::from_args_with(
+            vec!["--addr".to_string(), "0.0.0.0".to_string()],
+            env(&[]),
+            fs(&[]),
+        )
+        .expect_err("must fail");
         assert_eq!(error, "unknown option: --addr");
     }
 
     #[test]
     fn an_empty_host_never_reaches_the_listener() {
-        let from_flag =
-            crate::Config::from_args(vec!["--host".to_string(), " ".to_string()], env(&[]))
-                .expect_err("a blank host is not an address");
+        let from_flag = crate::Config::from_args_with(
+            vec!["--host".to_string(), " ".to_string()],
+            env(&[]),
+            fs(&[]),
+        )
+        .expect_err("a blank host is not an address");
         assert!(from_flag.contains("host"), "{from_flag}");
 
-        let from_env = crate::Config::from_args(Vec::<String>::new(), env(&[("UPLAND_HOST", "")]))
-            .expect_err("an empty host is not an address");
+        let from_env = crate::Config::from_args_with(
+            Vec::<String>::new(),
+            env(&[("UPLAND_HOST", "")]),
+            fs(&[]),
+        )
+        .expect_err("an empty host is not an address");
         assert!(from_env.contains("host"), "{from_env}");
     }
 
@@ -589,23 +764,28 @@ mod tests {
         // Formula/upland.rb's `test do` runs `upland --version` and matches its
         // own pinned version against the output, so --version must be a print,
         // and it must be reached even when the rest of the command line is bad.
-        let version = crate::parse_args(vec!["--version".to_string()], env(&[])).expect("version");
+        let version = crate::parse_args_with(vec!["--version".to_string()], env(&[]), fs(&[]))
+            .expect("version");
         assert!(matches!(version, crate::Invocation::Version));
-        let short = crate::parse_args(vec!["-V".to_string()], env(&[])).expect("short version");
+        let short = crate::parse_args_with(vec!["-V".to_string()], env(&[]), fs(&[]))
+            .expect("short version");
         assert!(matches!(short, crate::Invocation::Version));
 
-        let help = crate::parse_args(vec!["--help".to_string()], env(&[])).expect("help");
+        let help =
+            crate::parse_args_with(vec!["--help".to_string()], env(&[]), fs(&[])).expect("help");
         assert!(matches!(help, crate::Invocation::Help));
-        let short_help = crate::parse_args(vec!["-h".to_string()], env(&[])).expect("short help");
+        let short_help =
+            crate::parse_args_with(vec!["-h".to_string()], env(&[]), fs(&[])).expect("short help");
         assert!(matches!(short_help, crate::Invocation::Help));
 
-        let bad = crate::parse_args(
+        let bad = crate::parse_args_with(
             vec![
                 "--version".to_string(),
                 "--port".to_string(),
                 "nope".to_string(),
             ],
             env(&[]),
+            fs(&[]),
         )
         .expect("version beats a broken port");
         assert!(matches!(bad, crate::Invocation::Version));
@@ -613,8 +793,12 @@ mod tests {
 
     #[test]
     fn serving_is_the_default_invocation() {
-        let serve = crate::parse_args(vec!["--port".to_string(), "9100".to_string()], env(&[]))
-            .expect("serve");
+        let serve = crate::parse_args_with(
+            vec!["--port".to_string(), "9100".to_string()],
+            env(&[]),
+            fs(&[]),
+        )
+        .expect("serve");
         match serve {
             crate::Invocation::Serve(config) => assert_eq!(config.port, 9100),
             _ => panic!("expected a server"),
@@ -653,9 +837,9 @@ mod tests {
         let config = crate::Config::from_args_with(
             vec!["--config".to_string(), "/tmp/upspeak.json".to_string()],
             env(&[]),
-            files(&[(
+            fs(&[(
                 "/tmp/upspeak.json",
-                r#"{ "server": { "host": "0.0.0.0", "port": 9300, "db_path": "/tmp/from-file.db" } }"#,
+                r#"{ "server": { "host": "0.0.0.0", "port": 9300, "db_path": "/tmp/from-file.db" }, "auth": { "jwt_secret": "abababababababababababababababababababababababababababababababab" } }"#,
             )]),
         )
         .expect("file");
@@ -669,7 +853,10 @@ mod tests {
         let config = crate::Config::from_args_with(
             vec!["--config".to_string(), "/tmp/upenv.json".to_string()],
             env(&[("UPLAND_PORT", "9400")]),
-            files(&[("/tmp/upenv.json", r#"{ "server": { "port": 9301 } }"#)]),
+            fs(&[(
+                "/tmp/upenv.json",
+                r#"{ "server": { "port": 9301 }, "auth": { "jwt_secret": "abababababababababababababababababababababababababababababababab" } }"#,
+            )]),
         )
         .expect("env beats file");
         assert_eq!(config.port, 9400);
@@ -687,9 +874,9 @@ mod tests {
                 "/tmp/upmix.json".to_string(),
             ],
             env(&[("UPLAND_HOST", "10.0.0.1")]),
-            files(&[(
+            fs(&[(
                 "/tmp/upmix.json",
-                r#"{ "server": { "host": "0.0.0.0", "port": 9302, "db_path": "/tmp/mixed.db" } }"#,
+                r#"{ "server": { "host": "0.0.0.0", "port": 9302, "db_path": "/tmp/mixed.db" }, "auth": { "jwt_secret": "abababababababababababababababababababababababababababababababab" } }"#,
             )]),
         )
         .expect("mixed");
@@ -703,7 +890,7 @@ mod tests {
         let error = crate::Config::from_args_with(
             vec!["--config".to_string(), "/tmp/upbad.json".to_string()],
             env(&[]),
-            files(&[("/tmp/upbad.json", r#"{ "server": { "hosts": "0.0.0.0" } }"#)]),
+            fs(&[("/tmp/upbad.json", r#"{ "server": { "hosts": "0.0.0.0" } }"#)]),
         )
         .expect_err("strict");
         assert!(error.contains("hosts"), "{error}");
@@ -715,7 +902,7 @@ mod tests {
         let error = crate::Config::from_args_with(
             vec!["--config".to_string(), "/tmp/upbroken.json".to_string()],
             env(&[]),
-            files(&[("/tmp/upbroken.json", "{ not json")]),
+            fs(&[("/tmp/upbroken.json", "{ not json")]),
         )
         .expect_err("must fail");
         assert!(error.contains("config"), "{error}");
@@ -728,18 +915,154 @@ mod tests {
         let error = crate::Config::from_args_with(
             vec!["--config".to_string(), "/tmp/upgone.json".to_string()],
             env(&[]),
-            files(&[]),
+            fs(&[]),
         )
         .expect_err("must fail");
         assert!(error.contains("/tmp/upgone.json"), "{error}");
     }
 
     #[test]
-    fn an_absent_config_at_the_default_path_is_not_an_error() {
-        let config = crate::Config::from_args_with(Vec::<String>::new(), env(&[]), files(&[]))
-            .expect("defaults");
+    fn an_absent_default_config_is_generated_before_it_is_read() {
+        // ADR-0005: the first boot writes the whole default document —
+        // secret included — and then resolves against what the file now
+        // holds, so the operator edits the file the server actually read.
+        let storage = fs(&[]);
+        let config = crate::Config::from_args_with(Vec::<String>::new(), env(&[]), &storage)
+            .expect("generated");
         assert_eq!(config.host, crate::DEFAULT_HOST);
         assert_eq!(config.port, crate::DEFAULT_PORT);
+        assert_eq!(config.ttl_seconds, crate::DEFAULT_TTL_SECONDS);
+        let contents = storage(&std::path::PathBuf::from(&config.config_path), None)
+            .expect("read back")
+            .expect("generated");
+        let document: serde_json::Value = serde_json::from_str(&contents).expect("valid json");
+        let secret = document["auth"]["jwt_secret"].as_str().expect("secret");
+        assert_eq!(secret.len(), 64);
+        assert!(secret.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(config.signing_secret.hex(), secret);
+        assert!(contents.ends_with('\n'));
+
+        // A second boot reads the same file, so both resolve one secret.
+        let again = crate::Config::from_args_with(Vec::<String>::new(), env(&[]), &storage)
+            .expect("second boot");
+        assert_eq!(again.signing_secret.hex(), config.signing_secret.hex());
+    }
+
+    #[test]
+    fn a_present_file_without_a_signing_secret_fails_naming_the_key() {
+        let error = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/upgrade.json".to_string()],
+            env(&[]),
+            fs(&[("/tmp/upgrade.json", r#"{ "server": { "port": 9300 } }"#)]),
+        )
+        .expect_err("must fail");
+        assert!(error.contains("jwt_secret"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_or_too_short_signing_secret_fails_too() {
+        for secret in ["", "abcd"] {
+            let error = crate::Config::from_args_with(
+                vec!["--config".to_string(), "/tmp/uphalf.json".to_string()],
+                env(&[]),
+                fs(&[(
+                    "/tmp/uphalf.json",
+                    &format!(r#"{{ "auth": {{ "jwt_secret": "{secret}" }} }}"#),
+                )]),
+            )
+            .expect_err("must fail");
+            assert!(error.contains("jwt_secret"), "{secret:?} produced {error}");
+        }
+    }
+
+    #[test]
+    fn replacing_the_secret_changes_what_the_server_signs_with() {
+        // The rotation story (ADR-0004): the file is the whole ceremony.
+        let old = r#"{ "auth": { "jwt_secret": "abababababababababababababababababababababababababababababababab" } }"#;
+        let new = r#"{ "auth": { "jwt_secret": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd" } }"#;
+        let before = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/urotate.json".to_string()],
+            env(&[]),
+            fs(&[("/tmp/urotate.json", old)]),
+        )
+        .expect("before");
+        let after = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/urotate.json".to_string()],
+            env(&[]),
+            fs(&[("/tmp/urotate.json", new)]),
+        )
+        .expect("after");
+        assert_ne!(before.signing_secret.hex(), after.signing_secret.hex());
+    }
+
+    #[test]
+    fn the_ttl_default_and_the_ttl_key_are_both_honest() {
+        let base =
+            "\"jwt_secret\": \"abababababababababababababababababababababababababababababababab\"";
+        let without = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/upttl1.json".to_string()],
+            env(&[]),
+            fs(&[(
+                "/tmp/upttl1.json",
+                &format!(r#"{{ "auth": {{ {base} }} }}"#),
+            )]),
+        )
+        .expect("default ttl");
+        assert_eq!(without.ttl_seconds, 86400);
+
+        let with = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/upttl2.json".to_string()],
+            env(&[]),
+            fs(&[(
+                "/tmp/upttl2.json",
+                &format!(r#"{{ "auth": {{ {base}, "ttl_seconds": 3600 }} }}"#),
+            )]),
+        )
+        .expect("configured ttl");
+        assert_eq!(with.ttl_seconds, 3600);
+
+        let zero = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/upttl3.json".to_string()],
+            env(&[]),
+            fs(&[(
+                "/tmp/upttl3.json",
+                &format!(r#"{{ "auth": {{ {base}, "ttl_seconds": 0 }} }}"#),
+            )]),
+        )
+        .expect_err("zero ttl must fail");
+        assert!(zero.contains("ttl_seconds"), "{zero}");
+    }
+
+    #[test]
+    fn provider_entries_parse_now_and_wait_for_task_seven_to_be_validated() {
+        let config = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/upprov.json".to_string()],
+            env(&[]),
+            fs(&[(
+                "/tmp/upprov.json",
+                r#"{ "auth": { "jwt_secret": "abababababababababababababababababababababababababababababababab", "oidc_providers": [ { "name": "work", "issuer": "https://id.example", "client_id": "upland" } ] } }"#,
+            )]),
+        )
+        .expect("providers");
+        assert_eq!(config.oidc_providers.len(), 1);
+        assert_eq!(config.oidc_providers[0].name, "work");
+        assert_eq!(config.oidc_providers[0].issuer, "https://id.example");
+    }
+
+    #[test]
+    fn a_config_never_prints_its_signing_secret() {
+        let config = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/updebug.json".to_string()],
+            env(&[]),
+            fs(&[(
+                "/tmp/updebug.json",
+                r#"{ "auth": { "jwt_secret": "abababababababababababababababababababababababababababababababab" } }"#,
+            )]),
+        )
+        .expect("config");
+        let text = format!("{config:?}");
+        assert!(text.contains("SigningSecret"), "{text}");
+        assert!(!text.contains("abab"), "{text}");
     }
 
     #[test]
@@ -747,7 +1070,7 @@ mod tests {
         let error = crate::Config::from_args_with(
             Vec::<String>::new(),
             env(&[("UPLAND_CONFIG", "")]),
-            files(&[]),
+            fs(&[]),
         )
         .expect_err("must fail");
         assert!(error.contains("config"), "{error}");
@@ -758,7 +1081,7 @@ mod tests {
         let error = crate::Config::from_args_with(
             vec!["--config".to_string(), "/tmp/upblank.json".to_string()],
             env(&[]),
-            files(&[("/tmp/upblank.json", r#"{ "server": { "host": " " } }"#)]),
+            fs(&[("/tmp/upblank.json", r#"{ "server": { "host": " " } }"#)]),
         )
         .expect_err("must fail");
         assert!(error.contains("host"), "{error}");
@@ -769,7 +1092,7 @@ mod tests {
         let error = crate::Config::from_args_with(
             vec!["--config".to_string(), "/tmp/upport.json".to_string()],
             env(&[]),
-            files(&[("/tmp/upport.json", r#"{ "server": { "port": 70000 } }"#)]),
+            fs(&[("/tmp/upport.json", r#"{ "server": { "port": 70000 } }"#)]),
         )
         .expect_err("must fail");
         assert!(error.contains("port"), "{error}");
@@ -777,7 +1100,7 @@ mod tests {
 
     #[test]
     fn the_default_config_path_shares_the_per_user_data_directory() {
-        let config = crate::Config::from_args_with(Vec::<String>::new(), env(&[]), files(&[]))
+        let config = crate::Config::from_args_with(Vec::<String>::new(), env(&[]), fs(&[]))
             .expect("defaults");
         #[cfg(target_os = "macos")]
         let expected =
@@ -802,23 +1125,32 @@ mod tests {
                 "/tmp/upflag.json".to_string(),
             ],
             env(&[]),
-            files(&[(
+            fs(&[(
                 "/tmp/upflag.json",
-                r#"{ "server": { "db_path": "/tmp/file.db" } }"#,
+                r#"{ "server": { "db_path": "/tmp/file.db" }, "auth": { "jwt_secret": "abababababababababababababababababababababababababababababababab" } }"#,
             )]),
         )
         .expect("flag");
         assert_eq!(config.db_path, std::path::Path::new("/tmp/flagged.db"));
     }
 
-    fn files<'a>(
-        entries: &'a [(&'a str, &'a str)],
-    ) -> impl Fn(&std::path::Path) -> Result<Option<String>, String> + 'a {
-        move |path| {
-            Ok(entries
+    fn fs(
+        entries: &[(&str, &str)],
+    ) -> impl Fn(&std::path::Path, Option<&str>) -> Result<Option<String>, String> {
+        let map = std::cell::RefCell::new(
+            entries
                 .iter()
-                .find(|(p, _)| std::path::Path::new(p) == path)
-                .map(|(_, contents)| (*contents).to_owned()))
+                .map(|(path, contents)| (path.to_string(), contents.to_string()))
+                .collect::<std::collections::HashMap<String, String>>(),
+        );
+        move |path, write| {
+            let key = path.display().to_string();
+            let mut map = map.borrow_mut();
+            if let Some(contents) = write {
+                map.entry(key.clone())
+                    .or_insert_with(|| contents.to_owned());
+            }
+            Ok(map.get(&key).cloned())
         }
     }
 
