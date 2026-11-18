@@ -2,7 +2,7 @@
 name = "upland"
 version = "0.1.0"
 edition = "2024"
-description = "Upland web application"
+description = "HTTP API server with an embedded web UI"
 license-file = "LICENSE"
 repository = "https://github.com/xminihub/upland"
 
