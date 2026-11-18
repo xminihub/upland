@@ -79,7 +79,9 @@ research tickets answered the facts:
 
 - `upland` grows its first runtime dependency beyond the web stack
   (`sqlx` + `libsqlite3-sys`); every release build host needs a C compiler
-  for the bundled SQLite — already true of the existing toolchains.
+  for the bundled SQLite, and the two musl targets need one that can target
+  musl — which the Ubuntu runners do not ship, so their build installs zig cc
+  first (ADR-0001).
 - Adding a query or migration means running `cargo sqlx prepare` locally
   (sqlx-cli) and committing the regenerated `.sqlx/`; CI builds offline and
   fails on stale metadata, which is the drift check.
