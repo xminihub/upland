@@ -2,7 +2,7 @@ import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { OIDC_PENDING_KEY } from "@/lib/oidc";
-import { setToken } from "@/lib/session";
+import { setToken } from "@/lib/access-token";
 import { renderApp } from "@/test/harness";
 
 function mockApi(handlers: Record<string, () => Response>) {
@@ -168,7 +168,7 @@ describe("Sign up screen", () => {
   });
 });
 
-describe("The session", () => {
+describe("The signed-in browser", () => {
   beforeEach(() => {
     setToken("stored-token");
   });
@@ -190,7 +190,7 @@ describe("The session", () => {
     expect(screen.getByText(/tess@example\.com/)).toBeInTheDocument();
   });
 
-  it("brings an expired session back to the login screen", async () => {
+  it("brings an expired access token back to the login screen", async () => {
     mockApi({
       "/api/v1/hello": () =>
         Response.json({ error: { code: "unauthorized" } }, { status: 401 }),

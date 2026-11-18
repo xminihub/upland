@@ -13,8 +13,8 @@ export const Route = createRootRoute({ component: RootLayout });
 function RootLayout() {
   const navigate = useNavigate();
 
-  // A 401 anywhere is the session ending (ADR-0004): the API layer has
-  // already forgotten the token, this decides the screen does too.
+  // A 401 anywhere ends the signed-in state (ADR-0004): the API layer
+  // has already forgotten the access token, this decides the screen too.
   useEffect(() => {
     const forget = () => {
       void navigate({ to: "/login" });

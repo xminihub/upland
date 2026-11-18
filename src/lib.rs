@@ -82,10 +82,21 @@ fn api(state: AppState) -> Router<AppState> {
         .route("/hello", get(hello))
         .route("/auth/me", get(me))
         .route("/auth/logout", post(logout))
-        .route_layer(from_fn_with_state(state, require_bearer));
+        .route_layer(from_fn_with_state(state.clone(), require_bearer));
     Router::new()
-        .nest("/v1", public.merge(guarded).fallback(api_not_found))
+        .nest("/v1", public.merge(guarded).fallback(v1_not_found))
         .fallback(api_not_found)
+}
+
+/// Unknown paths behind the version prefix answer only to callers bearing
+/// a valid token (spec #13: every `/api/v1` route requires a token by
+/// default — the exemption list is named routes, not known routes). The
+/// fallback sits outside the middleware, so it runs the check itself.
+async fn v1_not_found(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match verified_bearer(&state, &headers).await {
+        Some(_) => json_not_found().into_response(),
+        None => unauthorized(),
+    }
 }
 
 /// The verified **access token**'s claims, published to handlers by the
@@ -114,27 +125,31 @@ async fn require_bearer(
     mut request: Request,
     next: Next,
 ) -> Response {
+    match verified_bearer(&state, &headers).await {
+        Some(claims) => {
+            request.extensions_mut().insert(Authenticated(claims));
+            next.run(request).await
+        }
+        None => unauthorized(),
+    }
+}
+
+/// The bearer check the guarded routes and the guarded prefix's 404 share
+/// (spec #13): signature/iss/aud/exp, then the account itself must exist.
+async fn verified_bearer(state: &AppState, headers: &HeaderMap) -> Option<auth::Claims> {
     let bearer = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .unwrap_or("");
-    let claims = match state.access_tokens.verify(bearer) {
-        Ok(claims) => claims,
-        Err(_) => return unauthorized(),
-    };
-    let Ok(subject) = claims.sub.parse::<i64>() else {
-        return unauthorized();
-    };
+    let claims = state.access_tokens.verify(bearer).ok()?;
+    let subject = claims.sub.parse::<i64>().ok()?;
     let alive = sqlx::query!("SELECT id FROM accounts WHERE id = ?", subject)
         .fetch_optional(state.db.reader())
         .await;
     match alive {
-        Ok(Some(_)) => {
-            request.extensions_mut().insert(Authenticated(claims));
-            next.run(request).await
-        }
-        _ => unauthorized(),
+        Ok(Some(_)) => Some(claims),
+        _ => None,
     }
 }
 
@@ -216,10 +231,7 @@ async fn signup(
         return internal();
     };
 
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock after 1970")
-        .as_secs() as i64;
+    let created_at = crate::auth::now();
     let inserted = sqlx::query!(
         "INSERT INTO accounts (username, email, created_at) VALUES (?, ?, ?) RETURNING id",
         username,
@@ -258,10 +270,7 @@ async fn signup(
         return internal();
     }
 
-    match state.access_tokens.mint(&id.to_string()) {
-        Ok(token) => (StatusCode::OK, Json(json!({ "access_token": token }))),
-        Err(_) => internal(),
-    }
+    token_for(&state, id).await
 }
 
 async fn taken_handle(state: &AppState, username: &str, email: &str) -> Option<&'static str> {
@@ -379,10 +388,7 @@ async fn login(
         return unauthorized_pair();
     }
 
-    match state.access_tokens.mint(&account.id.to_string()) {
-        Ok(token) => (StatusCode::OK, Json(json!({ "access_token": token }))),
-        Err(_) => internal(),
-    }
+    token_for(&state, account.id).await
 }
 
 async fn me(
@@ -529,16 +535,9 @@ async fn oidc_exchange(
         .fetch_optional(state.db.reader())
         .await
     {
-        if sqlx::query!(
-            "INSERT INTO identities (provider_name, issuer, subject, account_id) VALUES (?, ?, ?, ?)",
-            provider.name,
-            provider.issuer,
-            identity.subject,
-            row.id
-        )
-        .execute(state.db.writer())
-        .await
-        .is_err()
+        if attach_identity(&state, &provider, &identity.subject, row.id)
+            .await
+            .is_err()
         {
             return internal();
         }
@@ -546,10 +545,7 @@ async fn oidc_exchange(
     }
 
     let base = derived_username(&email);
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock after 1970")
-        .as_secs() as i64;
+    let created_at = crate::auth::now();
     for attempt in 0..100u32 {
         let username = candidate_username(&base, attempt);
         let inserted = sqlx::query!(
@@ -562,16 +558,9 @@ async fn oidc_exchange(
         .await;
         match inserted {
             Ok(row) => {
-                if sqlx::query!(
-                    "INSERT INTO identities (provider_name, issuer, subject, account_id) VALUES (?, ?, ?, ?)",
-                    provider.name,
-                    provider.issuer,
-                    identity.subject,
-                    row.id
-                )
-                .execute(state.db.writer())
-                .await
-                .is_err()
+                if attach_identity(&state, &provider, &identity.subject, row.id)
+                    .await
+                    .is_err()
                 {
                     let _ = sqlx::query!("DELETE FROM accounts WHERE id = ?", row.id)
                         .execute(state.db.writer())
@@ -580,13 +569,11 @@ async fn oidc_exchange(
                 }
                 return token_for(&state, row.id).await;
             }
-            Err(error) => {
-                let taken_by_username = error.to_string().contains("accounts.username");
-                let taken_by_email = error.to_string().contains("accounts.email");
-                if taken_by_username {
-                    continue;
-                }
-                if taken_by_email {
+            Err(error) => match collision_of(&error) {
+                // A name in the wild took the derived handle: try the
+                // next suffix.
+                Some("username_taken") => continue,
+                Some(_) => {
                     // Raced with a password signup of the same email:
                     // link to that account instead of failing.
                     if let Ok(Some(row)) =
@@ -594,23 +581,36 @@ async fn oidc_exchange(
                             .fetch_optional(state.db.reader())
                             .await
                     {
-                        let _ = sqlx::query!(
-                            "INSERT INTO identities (provider_name, issuer, subject, account_id) VALUES (?, ?, ?, ?)",
-                            provider.name,
-                            provider.issuer,
-                            identity.subject,
-                            row.id
-                        )
-                        .execute(state.db.writer())
-                        .await;
+                        let _ = attach_identity(&state, &provider, &identity.subject, row.id).await;
                         return token_for(&state, row.id).await;
                     }
+                    return internal();
                 }
-                return internal();
-            }
+                None => return internal(),
+            },
         }
     }
     internal()
+}
+
+/// Attaches an (issuer, subject) pair to an account (ADR-0004): the
+/// identity row is what makes the next OIDC sign-in land in the same one.
+async fn attach_identity(
+    state: &AppState,
+    provider: &OidcProvider,
+    subject: &str,
+    account_id: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query!(
+        "INSERT INTO identities (provider_name, issuer, subject, account_id) VALUES (?, ?, ?, ?)",
+        provider.name,
+        provider.issuer,
+        subject,
+        account_id
+    )
+    .execute(state.db.writer())
+    .await
+    .map(|_| ())
 }
 
 async fn token_for(state: &AppState, account_id: i64) -> (StatusCode, Json<Value>) {
@@ -632,7 +632,9 @@ fn derived_username(email: &str) -> String {
         })
         .collect();
     let trimmed = sanitized.trim_matches(|c| c == '.' || c == '-' || c == '_');
-    if trimmed.is_empty() {
+    if trimmed.chars().count() < 3 {
+        // A handle shorter than the username rules (3–32) is one signup
+        // would refuse; the fallback carries the feature's name instead.
         "oidc".to_owned()
     } else {
         trimmed.chars().take(28).collect()
@@ -707,8 +709,10 @@ pub struct OidcProvider {
 
 /// The per-user data directory a platform expects a server's state in. No
 /// `directories` dependency: three known paths, each resolved from
-/// environment a launcher already sets.
-fn data_directory(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+/// environment a launcher already sets. `hint` names the escape hatch for
+/// whatever is being resolved — blaming `--db-path` for a missing
+/// **config path** would send the operator to the wrong key.
+fn data_directory(env: &impl Fn(&str) -> Option<String>, hint: &str) -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
     let dir = env("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"));
     #[cfg(target_os = "windows")]
@@ -720,17 +724,22 @@ fn data_directory(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, Stri
 
     let dir = dir.filter(|dir| !dir.as_os_str().is_empty());
     dir.ok_or_else(|| {
-        "cannot resolve a default data directory: no data directory in the environment; set --db-path or UPLAND_DB_PATH"
-            .to_owned()
+        format!(
+            "cannot resolve a default data directory: no data directory in the environment; {hint}"
+        )
     })
 }
 
 fn default_db_path(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
-    Ok(data_directory(env)?.join("upland").join("upland.db"))
+    Ok(data_directory(env, "set --db-path or UPLAND_DB_PATH")?
+        .join("upland")
+        .join("upland.db"))
 }
 
 fn default_config_path(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
-    Ok(data_directory(env)?.join("upland").join("config.json"))
+    Ok(data_directory(env, "set --config or UPLAND_CONFIG")?
+        .join("upland")
+        .join("config.json"))
 }
 
 /// The **config file** (ADR-0005): strict JSON — an unknown key names
@@ -802,28 +811,49 @@ fn create_config_file(path: &Path, contents: &str) -> Result<(), String> {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
     }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = match options.open(path) {
-        Ok(file) => file,
-        // A racing boot won and wrote its own secret; the re-read below
-        // resolves both servers onto the same file.
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(()),
-        Err(error) => {
-            return Err(format!(
-                "cannot create config file {}: {error}",
-                path.display()
-            ));
+    // ADR-0005's atomic write: publish through a sibling temp file and a
+    // hard link, so the config path either does not exist or names a
+    // complete document. A hard link never overwrites — the racing boot
+    // that loses the create keeps the winner's secret, and both re-reads
+    // resolve onto the same file.
+    static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let name = path
+        .file_name()
+        .ok_or_else(|| format!("config path {} names no file", path.display()))?
+        .to_string_lossy();
+    let temp = path.with_file_name(format!(
+        "{name}.tmp-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let wrote = (|| -> Result<(), String> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-    };
-    use std::io::Write;
-    file.write_all(contents.as_bytes())
-        .map_err(|error| format!("cannot write config file {}: {error}", path.display()))
+        let mut file = options
+            .open(&temp)
+            .map_err(|error| format!("cannot create config file {}: {error}", path.display()))?;
+        use std::io::Write;
+        file.write_all(contents.as_bytes())
+            .map_err(|error| format!("cannot write config file {}: {error}", path.display()))?;
+        drop(file);
+        std::fs::hard_link(&temp, path).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(()) // a racing boot published its own file first; keep theirs
+            } else {
+                Err(format!(
+                    "cannot create config file {}: {error}",
+                    path.display()
+                ))
+            }
+        })
+    })();
+    let _ = std::fs::remove_file(&temp);
+    wrote
 }
 
 /// The storage seam (ADR-0005): `read_or_create(path, None)` reads;
@@ -1521,6 +1551,46 @@ mod tests {
         )
         .expect_err("must fail");
         assert!(error.contains("config"), "{error}");
+    }
+
+    #[test]
+    fn generation_publishes_the_whole_file_and_keeps_the_winners_copy() {
+        // ADR-0005: "an atomic write so two racing boots cannot tear it".
+        // On a real filesystem: the published file holds the complete
+        // document the moment its name exists, a second create never
+        // rewrites the first boot's secret, and nothing is left behind.
+        static COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "upland-config-publish-{}-{unique}",
+            std::process::id()
+        ));
+        let path = dir.join("config.json");
+
+        crate::create_config_file(&path, "first document").expect("create");
+        let contents =
+            std::fs::read_to_string(&path).expect("published file holds the whole write");
+        assert_eq!(contents, "first document");
+
+        crate::create_config_file(&path, "second document").expect("racing boot loses quietly");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("file survives"),
+            "first document",
+            "a loser must not rewrite the winner's secret"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir readable")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(leftovers, ["config.json"], "temp files must not linger");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 
     #[test]

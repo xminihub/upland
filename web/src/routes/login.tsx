@@ -3,9 +3,9 @@ import { useState } from "react";
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
 
 import { login } from "@/lib/api";
-import { applyError, type FieldErrors } from "@/lib/error-copy";
+import { applyError, toErrors, type FieldErrors } from "@/lib/error-copy";
 import { flowCopy, listProviders, startLogin } from "@/lib/oidc";
-import { setToken } from "@/lib/session";
+import { setToken } from "@/lib/access-token";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -147,8 +147,4 @@ function Login() {
       </Card>
     </div>
   );
-}
-
-function toErrors(message?: string): Array<{ message?: string }> {
-  return message ? [{ message }] : [];
 }

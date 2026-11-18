@@ -3,7 +3,7 @@
 // 401 anywhere forgetting the token and heading back to the login screen
 // — the arc the route guard then shows.
 
-import { clearToken, getToken } from "./session.ts";
+import { clearToken, getToken } from "./access-token.ts";
 
 export type ApiError = {
   status: number;

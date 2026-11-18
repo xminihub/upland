@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
 
-import { setToken } from "@/lib/session";
+import { setToken } from "@/lib/access-token";
 import { errorCode, finishLogin } from "@/lib/oidc";
 
 export const Route = createFileRoute("/oauth/callback")({
@@ -18,7 +18,7 @@ function Callback() {
   const navigate = useNavigate();
 
   // The IdP's bounce back: one shot at the trade, then the login screen
-  // either holds the session or names what went wrong (ADR-0004).
+  // either holds the access token or names what went wrong (ADR-0004).
   const code = search.code;
   const state = search.state;
   const error = search.error;

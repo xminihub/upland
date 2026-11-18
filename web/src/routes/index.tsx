@@ -4,7 +4,7 @@ import { createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
 import { StateCard } from "@/components/state-card";
 import { Button } from "@/components/ui/button";
 import { fetchHello, fetchMe, logout } from "@/lib/api";
-import { clearToken, getToken } from "@/lib/session";
+import { clearToken, getToken } from "@/lib/access-token";
 
 export const Route = createFileRoute("/")({
   // The guard (ADR-0004): the app's data is behind a token, so the app

@@ -82,6 +82,33 @@ async fn api_consumer_gets_json_not_found_for_unknown_api_path() {
 }
 
 #[tokio::test]
+async fn unknown_paths_under_the_version_prefix_answer_only_to_a_token() {
+    // Spec #13: everything under /api/v1 requires a bearer token by
+    // default — the exemption list is named routes, not "known routes",
+    // so an unseen path behind the prefix fails like a guarded one.
+    let server = test_server().await;
+    server
+        .get("/api/v1/nope")
+        .await
+        .assert_status_unauthorized();
+
+    let response = signup(&server, "Fallback", "fallback@example.com", "password").await;
+    let token = response.json::<Value>()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let authenticated = server
+        .get("/api/v1/nope")
+        .add_header("authorization", format!("Bearer {token}"))
+        .await;
+    authenticated.assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(
+        authenticated.json::<Value>(),
+        json!({ "error": { "code": "not_found" } })
+    );
+}
+
+#[tokio::test]
 async fn operator_can_check_health() {
     let server = test_server().await;
     let response = server.get("/healthz").await;

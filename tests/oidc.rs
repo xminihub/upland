@@ -218,6 +218,35 @@ async fn a_derived_username_collision_gets_a_suffix() {
 }
 
 #[tokio::test]
+async fn a_short_local_part_still_derives_a_legal_handle() {
+    // The username rules (3–32) bind the derived handle too: "ab" alone
+    // is a name signup would refuse, so the fallback carries the weight.
+    let server = server_with(
+        vec![provider("work", "https://id.example", "cid")],
+        &[
+            ("work", "tiny-token", "ab@example.com"),
+            ("work", "dots-token", "..@example.com"),
+        ],
+    )
+    .await;
+    let first = oidc_login(&server, "work", "tiny-token").await;
+    first.assert_status_ok();
+    let first_token = first.json::<Value>()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(me(&server, &first_token).await["username"], "oidc");
+
+    let second = oidc_login(&server, "work", "dots-token").await;
+    second.assert_status_ok();
+    let second_token = second.json::<Value>()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(me(&server, &second_token).await["username"], "oidc-2");
+}
+
+#[tokio::test]
 async fn a_provider_that_asserts_no_email_buys_no_account() {
     let server = server_with(
         vec![provider("work", "https://id.example", "cid")],

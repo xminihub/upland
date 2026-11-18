@@ -43,7 +43,11 @@ makes the format promise the rejection said was missing.
   install — the brew service, the `cargo run` on a laptop — writes the full
   default document (defaults in `server`, `ttl_seconds` 86400, an empty
   provider list, a random 32-byte hex `jwt_secret`) at mode `0600`, with an
-  atomic write so two racing boots cannot tear it. The operator then owns
+  atomic write so two racing boots cannot tear it. Generation is the
+  *default location's* right: a path the operator named with `--config` or
+  `UPLAND_CONFIG` must exist, because a mistyped named path is the same
+  silent-misconfiguration this file's strict parsing exists to refuse, and
+  generating there would paper over it. The operator then owns
   the file: replacing the secret and restarting is the revocation story
   ADR-0004 has no table for.
 - **Provider records carry no client secret.** The OIDC flow is browser-side

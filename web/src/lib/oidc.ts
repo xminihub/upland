@@ -3,6 +3,7 @@
 // backend and never trusts it; real verification is the backend's job.
 
 import { ApiRequestError, apiRequest } from "./api.ts";
+import { apiCopy } from "./error-copy";
 
 export const OIDC_PENDING_KEY = "upland_oidc_pending";
 export const OIDC_CALLBACK_PATH = "/oauth/callback";
@@ -159,14 +160,10 @@ export function flowCopy(code: string): string {
       return "The provider refused the sign-in.";
     case "exchange_refused":
       return "The provider would not trade the code for a token.";
-    case "oidc_rejected":
-      return "The provider's sign-in response was not accepted.";
-    case "provider_no_email":
-      return "The provider did not share an email address.";
-    case "provider_unknown":
-      return "That sign-in method is not configured.";
     default:
-      return "Could not reach the provider.";
+      // A code the backend answered with is the forms' copy to give;
+      // anything else means the issuer itself never spoke.
+      return apiCopy(code) ?? "Could not reach the provider.";
   }
 }
 

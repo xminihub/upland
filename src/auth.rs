@@ -27,7 +27,7 @@ impl SigningSecret {
 
     pub fn from_hex(value: &str) -> Result<Self, String> {
         if !value.len().is_multiple_of(2) || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Err("not a signing secret: expected lowercase hex".to_owned());
+            return Err("not a signing secret: expected an even run of hex digits".to_owned());
         }
         let bytes = (0..value.len())
             .step_by(2)
@@ -137,7 +137,7 @@ impl AccessTokenIssuer {
     }
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after 1970")

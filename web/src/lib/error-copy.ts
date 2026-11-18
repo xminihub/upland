@@ -14,6 +14,18 @@ const FIELD_COPY: Record<string, string> = {
   provider_no_email: "The provider did not share an email address.",
 };
 
+// The one home of the API-code copy, so the browser-side flow (oidc.ts)
+// can quote it without restating a sentence two places must keep in step.
+export function apiCopy(code: string): string | undefined {
+  return FIELD_COPY[code];
+}
+
+// shadcn's FieldError takes a list of problems; a form holds at most one
+// per field, and "no message" is the empty list.
+export function toErrors(message?: string): Array<{ message?: string }> {
+  return message ? [{ message }] : [];
+}
+
 const RULES: Record<string, Record<string, string>> = {
   username: {
     invalid:

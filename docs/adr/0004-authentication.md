@@ -76,6 +76,9 @@ session that walked the whole design tree; the spec is
 - A stolen token is valid until it expires, and the server cannot shorten
   that: the stateless choice bought no-restart-revocation-free operation with
   real revocation's absence. The signing-secret edit is the escape hatch.
+  The one crack: the bearer middleware requires the account still to exist,
+  so the day account delete is built, deleting an account ends its tokens'
+  life immediately — revocation-by-removal, not revocation-by-list.
 - Any XSS in the SPA can read the stored token — the accepted price of
   bearer-only uniformity between browser and scripted clients.
 - A lax IdP that over-asserts emails can hand a password account's front door
