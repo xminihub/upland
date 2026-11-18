@@ -43,6 +43,17 @@ jobs:
           name: web-dist
           path: web/dist
 
+  packaging:
+    name: Packaging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # GNU tar is what the org tap's contract is written with, and this
+      # repository's tarballs are packed by it on Linux, so the assertions run
+      # here rather than in cargo test, where a developer's tar is bsdtar.
+      - name: Assert the brew tarball contract
+        run: bash scripts/test-package-brew-tarball.sh
+
   test:
     name: Test
     runs-on: ubuntu-latest
