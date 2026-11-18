@@ -1938,6 +1938,7 @@ dependencies = [
  "axum",
  "axum-test",
  "rust-embed",
+ "serde",
  "serde_json",
  "sqlx",
  "tokio",

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::Json;
@@ -88,30 +88,71 @@ pub struct Config {
     /// per-user data directory so `brew services` and a bare `upland` run
     /// start in the same place (ADR-0003).
     pub db_path: PathBuf,
+    /// The **config path** (CONTEXT.md, ADR-0005): where the **config file**
+    /// was read from, defaulting beside the **database path**.
+    pub config_path: PathBuf,
 }
 
 /// The per-user data directory a platform expects a server's state in. No
 /// `directories` dependency: three known paths, each resolved from
 /// environment a launcher already sets.
-fn default_db_path(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
-    let file_name = "upland.db";
+fn data_directory(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
     #[cfg(target_os = "macos")]
-    let data_dir = env("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"));
+    let dir = env("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"));
     #[cfg(target_os = "windows")]
-    let data_dir = env("APPDATA").map(PathBuf::from);
+    let dir = env("APPDATA").map(PathBuf::from);
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let data_dir = env("XDG_DATA_HOME")
+    let dir = env("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".local/share")));
 
-    let data_dir = data_dir.filter(|dir| !dir.as_os_str().is_empty());
-    match data_dir {
-        Some(dir) => Ok(dir.join("upland").join(file_name)),
-        None => Err(
-            "cannot resolve a default database path: no data directory in the environment; set --db-path or UPLAND_DB_PATH"
-                .to_owned(),
-        ),
+    let dir = dir.filter(|dir| !dir.as_os_str().is_empty());
+    dir.ok_or_else(|| {
+        "cannot resolve a default data directory: no data directory in the environment; set --db-path or UPLAND_DB_PATH"
+            .to_owned()
+    })
+}
+
+fn default_db_path(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+    Ok(data_directory(env)?.join("upland").join("upland.db"))
+}
+
+fn default_config_path(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+    Ok(data_directory(env)?.join("upland").join("config.json"))
+}
+
+/// The **config file** (ADR-0005): strict JSON — an unknown key names
+/// itself and fails the boot, because a silently ignored `oidc_provideers`
+/// means an issuer nobody configured.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    #[serde(default)]
+    server: FileServer,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileServer {
+    host: Option<String>,
+    port: Option<u16>,
+    db_path: Option<String>,
+}
+
+fn read_config_file(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "cannot read config file {}: {error}",
+            path.display()
+        )),
     }
+}
+
+fn parse_file_config(path: &Path, contents: &str) -> Result<FileConfig, String> {
+    serde_json::from_str(contents)
+        .map_err(|error| format!("invalid config file {}: {error}", path.display()))
 }
 
 pub enum Invocation {
@@ -134,10 +175,14 @@ Options:
       --host <host>    Bind address (default {DEFAULT_HOST})
       --port <port>    Listen port (default {DEFAULT_PORT})
       --db-path <path> Database file (default: a per-user data directory)
+      --config <path>  Config file (default: upland/config.json beside it)
 
 Environment:
   UPLAND_HOST, UPLAND_PORT, UPLAND_DB_PATH
       Defaults for --host, --port and --db-path; the flags win.
+  UPLAND_CONFIG
+      Default for --config; the flag wins. Precedence overall is
+      flag, then environment, then config file, then built-in default.
 "
     )
 }
@@ -158,16 +203,22 @@ fn flag_value<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a St
         .ok_or_else(|| format!("{name} requires a value"))
 }
 
-fn bind_and_storage<I, S, E>(args: I, env: &E) -> Result<(String, u16, PathBuf), String>
+fn bind_and_storage<I, S, E, R>(
+    args: I,
+    env: &E,
+    read: &R,
+) -> Result<(String, u16, PathBuf, PathBuf), String>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
     E: Fn(&str) -> Option<String>,
+    R: Fn(&Path) -> Result<Option<String>, String>,
 {
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
     let mut host: Option<String> = None;
     let mut port: Option<u16> = None;
     let mut db_path: Option<String> = None;
+    let mut config_path: Option<String> = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -186,12 +237,43 @@ where
                 db_path = Some(flag_value(&args, index, flag)?.clone());
                 index += 2;
             }
+            "--config" => {
+                config_path = Some(flag_value(&args, index, flag)?.clone());
+                index += 2;
+            }
             other => return Err(format!("unknown option: {other}")),
         }
     }
 
+    // The config path itself is resolved flag > env > default; an explicit
+    // value that is empty is a failure, and an explicit file that is absent
+    // is a failure — a named path is a promise, not a hint.
+    let explicit_config = config_path.clone().or_else(|| env("UPLAND_CONFIG"));
+    if let Some(value) = explicit_config.as_ref()
+        && value.trim().is_empty()
+    {
+        return Err("not a config path: the value must not be empty".to_owned());
+    }
+    let explicit = explicit_config.is_some();
+    let config_path = match explicit_config {
+        Some(value) => PathBuf::from(value),
+        None => default_config_path(env)?,
+    };
+    let contents = read(&config_path)?;
+    if contents.is_none() && explicit {
+        return Err(format!("config file not found: {}", config_path.display()));
+    }
+    let file = match contents {
+        Some(contents) => parse_file_config(&config_path, &contents)?,
+        None => FileConfig::default(),
+    };
+    let server = file.server;
+
+    // Precedence (ADR-0005): flag > environment > file > built-in default,
+    // resolved per key.
     let host = host
         .or_else(|| env("UPLAND_HOST"))
+        .or(server.host)
         .unwrap_or_else(|| DEFAULT_HOST.to_owned());
     if host.trim().is_empty() {
         return Err("not a host: the bind address must not be empty".to_owned());
@@ -204,14 +286,14 @@ where
         Some(port) => port,
         None => match env("UPLAND_PORT") {
             Some(value) => parse_port(&value)?,
-            None => DEFAULT_PORT,
+            None => server.port.unwrap_or(DEFAULT_PORT),
         },
     };
     // An empty UPLAND_DB_PATH is a failure rather than a nudge back to the
     // default: a unit file that lost its path
     // mid-edit would otherwise open a database nobody pointed it at, in a
     // directory nobody chose.
-    let db_path = match db_path.or_else(|| env("UPLAND_DB_PATH")) {
+    let db_path = match db_path.or_else(|| env("UPLAND_DB_PATH")).or(server.db_path) {
         Some(value) if value.trim().is_empty() => {
             return Err("not a database path: the value must not be empty".to_owned());
         }
@@ -219,7 +301,7 @@ where
         None => default_db_path(env)?,
     };
 
-    Ok((host, port, db_path))
+    Ok((host, port, db_path, config_path))
 }
 
 impl Config {
@@ -241,11 +323,25 @@ impl Config {
         S: Into<String>,
         E: Fn(&str) -> Option<String>,
     {
-        let (host, port, db_path) = bind_and_storage(args, &env)?;
+        Self::from_args_with(args, env, read_config_file)
+    }
+
+    /// The same resolution with the file read injected, so the precedence
+    /// of flag, environment and **config file** is testable without ever
+    /// touching a real disk.
+    pub fn from_args_with<I, S, E, R>(args: I, env: E, read: R) -> Result<Self, String>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        E: Fn(&str) -> Option<String>,
+        R: Fn(&Path) -> Result<Option<String>, String>,
+    {
+        let (host, port, db_path, config_path) = bind_and_storage(args, &env, &read)?;
         Ok(Self {
             host,
             port,
             db_path,
+            config_path,
         })
     }
 }
@@ -540,13 +636,189 @@ mod tests {
             "--host",
             "--port",
             "--db-path",
+            "--config",
             "--version",
             "--help",
             "UPLAND_PORT",
             "UPLAND_DB_PATH",
+            "UPLAND_CONFIG",
             "127.0.0.1",
         ] {
             assert!(usage.contains(expected), "usage omits {expected}");
+        }
+    }
+
+    #[test]
+    fn the_config_file_applies_when_nothing_higher_speaks() {
+        let config = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/upspeak.json".to_string()],
+            env(&[]),
+            files(&[(
+                "/tmp/upspeak.json",
+                r#"{ "server": { "host": "0.0.0.0", "port": 9300, "db_path": "/tmp/from-file.db" } }"#,
+            )]),
+        )
+        .expect("file");
+        assert_eq!(config.host, "0.0.0.0");
+        assert_eq!(config.port, 9300);
+        assert_eq!(config.db_path, std::path::Path::new("/tmp/from-file.db"));
+    }
+
+    #[test]
+    fn the_environment_beats_the_config_file() {
+        let config = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/upenv.json".to_string()],
+            env(&[("UPLAND_PORT", "9400")]),
+            files(&[("/tmp/upenv.json", r#"{ "server": { "port": 9301 } }"#)]),
+        )
+        .expect("env beats file");
+        assert_eq!(config.port, 9400);
+    }
+
+    #[test]
+    fn flags_env_and_file_are_resolved_per_key() {
+        // Each key takes the highest voice that speaks it; the file's
+        // db_path survives underneath a flag port and an env host.
+        let config = crate::Config::from_args_with(
+            vec![
+                "--port".to_string(),
+                "7000".to_string(),
+                "--config".to_string(),
+                "/tmp/upmix.json".to_string(),
+            ],
+            env(&[("UPLAND_HOST", "10.0.0.1")]),
+            files(&[(
+                "/tmp/upmix.json",
+                r#"{ "server": { "host": "0.0.0.0", "port": 9302, "db_path": "/tmp/mixed.db" } }"#,
+            )]),
+        )
+        .expect("mixed");
+        assert_eq!(config.port, 7000);
+        assert_eq!(config.host, "10.0.0.1");
+        assert_eq!(config.db_path, std::path::Path::new("/tmp/mixed.db"));
+    }
+
+    #[test]
+    fn an_unknown_config_key_fails_naming_the_key() {
+        let error = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/upbad.json".to_string()],
+            env(&[]),
+            files(&[("/tmp/upbad.json", r#"{ "server": { "hosts": "0.0.0.0" } }"#)]),
+        )
+        .expect_err("strict");
+        assert!(error.contains("hosts"), "{error}");
+        assert!(error.contains("config"), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_config_file_is_a_failure() {
+        let error = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/upbroken.json".to_string()],
+            env(&[]),
+            files(&[("/tmp/upbroken.json", "{ not json")]),
+        )
+        .expect_err("must fail");
+        assert!(error.contains("config"), "{error}");
+    }
+
+    #[test]
+    fn an_explicit_config_path_that_does_not_exist_fails_by_name() {
+        // A default location may be missing; a path the operator named is
+        // a promise, and a broken promise is a failure, not a fallback.
+        let error = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/upgone.json".to_string()],
+            env(&[]),
+            files(&[]),
+        )
+        .expect_err("must fail");
+        assert!(error.contains("/tmp/upgone.json"), "{error}");
+    }
+
+    #[test]
+    fn an_absent_config_at_the_default_path_is_not_an_error() {
+        let config = crate::Config::from_args_with(Vec::<String>::new(), env(&[]), files(&[]))
+            .expect("defaults");
+        assert_eq!(config.host, crate::DEFAULT_HOST);
+        assert_eq!(config.port, crate::DEFAULT_PORT);
+    }
+
+    #[test]
+    fn an_empty_config_path_is_a_failure_not_a_nudge() {
+        let error = crate::Config::from_args_with(
+            Vec::<String>::new(),
+            env(&[("UPLAND_CONFIG", "")]),
+            files(&[]),
+        )
+        .expect_err("must fail");
+        assert!(error.contains("config"), "{error}");
+    }
+
+    #[test]
+    fn a_blank_host_in_the_file_is_a_failure_naming_the_key() {
+        let error = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/upblank.json".to_string()],
+            env(&[]),
+            files(&[("/tmp/upblank.json", r#"{ "server": { "host": " " } }"#)]),
+        )
+        .expect_err("must fail");
+        assert!(error.contains("host"), "{error}");
+    }
+
+    #[test]
+    fn a_port_out_of_range_in_the_file_fails_naming_the_port() {
+        let error = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/upport.json".to_string()],
+            env(&[]),
+            files(&[("/tmp/upport.json", r#"{ "server": { "port": 70000 } }"#)]),
+        )
+        .expect_err("must fail");
+        assert!(error.contains("port"), "{error}");
+    }
+
+    #[test]
+    fn the_default_config_path_shares_the_per_user_data_directory() {
+        let config = crate::Config::from_args_with(Vec::<String>::new(), env(&[]), files(&[]))
+            .expect("defaults");
+        #[cfg(target_os = "macos")]
+        let expected =
+            std::path::Path::new("/home/tester/Library/Application Support/upland/config.json");
+        #[cfg(target_os = "windows")]
+        let expected =
+            std::path::Path::new("C:\\Users\\tester\\AppData\\Roaming\\upland\\config.json");
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let expected = std::path::Path::new("/home/tester/.local/share/upland/config.json");
+        assert_eq!(config.config_path, expected);
+    }
+
+    #[test]
+    fn the_config_file_is_replaced_by_a_flag_not_merged_around_it() {
+        // --db-path says "this database"; the file's db_path must not
+        // reopen underneath the operator's explicit word.
+        let config = crate::Config::from_args_with(
+            vec![
+                "--db-path".to_string(),
+                "/tmp/flagged.db".to_string(),
+                "--config".to_string(),
+                "/tmp/upflag.json".to_string(),
+            ],
+            env(&[]),
+            files(&[(
+                "/tmp/upflag.json",
+                r#"{ "server": { "db_path": "/tmp/file.db" } }"#,
+            )]),
+        )
+        .expect("flag");
+        assert_eq!(config.db_path, std::path::Path::new("/tmp/flagged.db"));
+    }
+
+    fn files<'a>(
+        entries: &'a [(&'a str, &'a str)],
+    ) -> impl Fn(&std::path::Path) -> Result<Option<String>, String> + 'a {
+        move |path| {
+            Ok(entries
+                .iter()
+                .find(|(p, _)| std::path::Path::new(p) == path)
+                .map(|(_, contents)| (*contents).to_owned()))
         }
     }
 
