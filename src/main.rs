@@ -21,6 +21,20 @@ async fn main() -> ExitCode {
     };
 
     let addr = format!("{}:{}", config.host, config.port);
+
+    // Open the database before binding: a machine that cannot write its data
+    // directory should fail without having taken a port first.
+    let db = match upland::db::Db::connect(&config.db_path).await {
+        Ok(db) => std::sync::Arc::new(db),
+        Err(error) => {
+            eprintln!(
+                "upland: cannot open the database at {}: {error}",
+                config.db_path.display()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => listener,
         Err(error) => {
@@ -30,7 +44,8 @@ async fn main() -> ExitCode {
     };
 
     println!("upland listening on http://{addr}");
-    axum::serve(listener, upland::router())
+    println!("upland database at {}", db.path().display());
+    axum::serve(listener, upland::router(upland::AppState { db }))
         .await
         .expect("server should run");
 

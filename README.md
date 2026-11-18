@@ -17,13 +17,25 @@ brew services start upland   # http://127.0.0.1:8310
 ```
 upland [OPTIONS]
 
-      --host <host>  Bind address (default 127.0.0.1)
-      --port <port>  Listen port (default 8080)
-  -V, --version      Print the version
-  -h, --help         Print this help
+      --host <host>     Bind address (default 127.0.0.1)
+      --port <port>     Listen port (default 8080)
+      --db-path <path>  Database file (default: a per-user data directory)
+  -V, --version         Print the version
+  -h, --help            Print this help
 ```
 
-`UPLAND_HOST` and `UPLAND_PORT` set defaults for the two flags; the flags win. upland binds loopback unless told otherwise, so reaching it from another machine is a choice you make in the invocation, in a service unit or in a container's args (ADR-0002).
+`UPLAND_HOST`, `UPLAND_PORT` and `UPLAND_DB_PATH` set defaults for the three flags; the flags win. upland binds loopback unless told otherwise, so reaching it from another machine is a choice you make in the invocation, in a service unit or in a container's args (ADR-0002).
+
+## Database
+
+Upland persists to a single embedded SQLite file through SQLx (ADR-0003): one writer connection plus a read pool, WAL, and migrations embedded from `migrations/` and applied at startup. Its location is the **database path**: `--db-path` or `UPLAND_DB_PATH`, defaulting to the platform's per-user data directory (macOS `~/Library/Application Support/upland/upland.db`, Linux `$XDG_DATA_HOME` or `~/.local/share/upland/upland.db`, Windows `%APPDATA%\upland\upland.db`). The database opens before the port binds; a path that cannot be written is a startup error, not a fallback.
+
+Queries are compile-time-checked SQLx macros against committed offline metadata (`.sqlx/`, `SQLX_OFFLINE=true` in `.env`), so builds and tests need no database service. After adding a query or a migration, regenerate the metadata locally:
+
+```sh
+cargo install sqlx-cli --no-default-features --features sqlite   # first time
+cargo sqlx prepare                                               # after changes
+```
 
 ## Endpoints
 
@@ -36,7 +48,8 @@ upland [OPTIONS]
 Backend:
 
 ```sh
-cargo run             # start the server on 127.0.0.1:8080
+cargo run             # start the server on 127.0.0.1:8080 (default per-user database path)
+cargo run -- --db-path ./upland.db   # a repo-local database for tinkering
 cargo test --locked   # unit tests + HTTP integration tests (axum-test, in-process)
 cargo fmt --check     # format
 cargo clippy --locked --all-targets  # lints (CI denies warnings)

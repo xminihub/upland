@@ -7,6 +7,8 @@
 - `cargo test --locked` — full suite (unit + HTTP integration tests)
 - `cargo run` — start the API server on `127.0.0.1:8080` (`--host`/`--port`, `UPLAND_HOST`/`UPLAND_PORT`)
 
+Persistence (ADR-0003): embedded SQLite through SQLx at the **database path** (`--db-path`/`UPLAND_DB_PATH`, per-user data directory by default). Queries are compile-time-checked macros against committed offline metadata: after adding a query or a migration, run `cargo sqlx prepare` locally (needs `sqlx-cli --no-default-features --features sqlite`) and commit `.sqlx/`; builds and tests run offline via `.env` (`SQLX_OFFLINE=true`) and need no database service.
+
 Frontend (`web/`, Bun; CI pins bun 1.4.4):
 
 - `bun install` — install (lockfile `web/bun.lock` is committed; use `--frozen-lockfile` in CI)

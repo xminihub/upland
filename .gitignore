@@ -2,3 +2,8 @@
 
 # rust rover
 .idea
+
+# a database pointed into the repo by --db-path: files, never committed
+*.db
+*.db-wal
+*.db-shm

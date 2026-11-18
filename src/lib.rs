@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
 use axum::Json;
 use axum::Router;
 use axum::http::StatusCode;
@@ -8,6 +11,10 @@ use axum::routing::get;
 use rust_embed::RustEmbed;
 use serde_json::{Value, json};
 
+pub mod db;
+
+use db::Db;
+
 #[derive(RustEmbed)]
 #[folder = "web/dist"]
 pub struct Assets;
@@ -16,10 +23,19 @@ pub fn spa_enabled() -> bool {
     Assets::iter().next().is_some()
 }
 
-pub fn router() -> Router {
-    let router = Router::new()
+/// Everything a handler may reach without taking arguments. The **database**
+/// lives here so the persistence shape (ADR-0003) is decided once, at
+/// construction, and never inside a handler.
+#[derive(Clone)]
+pub struct AppState {
+    pub db: Arc<Db>,
+}
+
+pub fn router(state: AppState) -> Router {
+    let router = Router::<AppState>::new()
         .nest("/api", api())
-        .route("/healthz", get(healthz));
+        .route("/healthz", get(healthz))
+        .with_state(state);
     if spa_enabled() {
         router.fallback(spa_fallback)
     } else {
@@ -38,7 +54,7 @@ async fn spa_fallback(uri: Uri) -> Response {
     }
 }
 
-fn api() -> Router {
+fn api() -> Router<AppState> {
     Router::new()
         .route("/hello", get(hello))
         .fallback(api_not_found)
@@ -67,6 +83,34 @@ pub const DEFAULT_PORT: u16 = 8080;
 pub struct Config {
     pub host: String,
     pub port: u16,
+    /// The **database path** (CONTEXT.md): one SQLite file, defaulting to a
+    /// per-user data directory so `brew services` and a bare `upland` run
+    /// start in the same place (ADR-0003).
+    pub db_path: PathBuf,
+}
+
+/// The per-user data directory a platform expects a server's state in. No
+/// `directories` dependency: three known paths, each resolved from
+/// environment a launcher already sets.
+fn default_db_path(env: &impl Fn(&str) -> Option<String>) -> Result<PathBuf, String> {
+    let file_name = "upland.db";
+    #[cfg(target_os = "macos")]
+    let data_dir = env("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"));
+    #[cfg(target_os = "windows")]
+    let data_dir = env("APPDATA").map(PathBuf::from);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let data_dir = env("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+
+    let data_dir = data_dir.filter(|dir| !dir.as_os_str().is_empty());
+    match data_dir {
+        Some(dir) => Ok(dir.join("upland").join(file_name)),
+        None => Err(
+            "cannot resolve a default database path: no data directory in the environment; set --db-path or UPLAND_DB_PATH"
+                .to_owned(),
+        ),
+    }
 }
 
 pub enum Invocation {
@@ -84,13 +128,15 @@ pub fn usage() -> String {
         "Usage: upland [OPTIONS]
 
 Options:
-  -h, --help         Print this help
-  -V, --version      Print the version
-      --host <host>  Bind address (default {DEFAULT_HOST})
-      --port <port>  Listen port (default {DEFAULT_PORT})
+  -h, --help           Print this help
+  -V, --version        Print the version
+      --host <host>    Bind address (default {DEFAULT_HOST})
+      --port <port>    Listen port (default {DEFAULT_PORT})
+      --db-path <path> Database file (default: a per-user data directory)
 
 Environment:
-  UPLAND_HOST, UPLAND_PORT  Defaults for --host and --port; the flags win.
+  UPLAND_HOST, UPLAND_PORT, UPLAND_DB_PATH
+      Defaults for --host, --port and --db-path; the flags win.
 "
     )
 }
@@ -111,7 +157,7 @@ fn flag_value<'a>(args: &'a [String], index: usize, name: &str) -> Result<&'a St
         .ok_or_else(|| format!("{name} requires a value"))
 }
 
-fn host_and_port<I, S, E>(args: I, env: &E) -> Result<(String, u16), String>
+fn bind_and_storage<I, S, E>(args: I, env: &E) -> Result<(String, u16, PathBuf), String>
 where
     I: IntoIterator<Item = S>,
     S: Into<String>,
@@ -120,6 +166,7 @@ where
     let args: Vec<String> = args.into_iter().map(Into::into).collect();
     let mut host: Option<String> = None;
     let mut port: Option<u16> = None;
+    let mut db_path: Option<String> = None;
 
     let mut index = 0;
     while index < args.len() {
@@ -132,6 +179,10 @@ where
             "--port" => {
                 let value = flag_value(&args, index, flag)?;
                 port = Some(parse_port(value)?);
+                index += 2;
+            }
+            "--db-path" => {
+                db_path = Some(flag_value(&args, index, flag)?.clone());
                 index += 2;
             }
             other => return Err(format!("unknown option: {other}")),
@@ -149,8 +200,19 @@ where
             .and_then(|value| value.parse::<u16>().ok())
             .filter(|port| *port > 0)
     });
+    // Unlike an unusable port, an empty UPLAND_DB_PATH is a failure rather
+    // than a nudge back to the default: a unit file that lost its path
+    // mid-edit would otherwise open a database nobody pointed it at, in a
+    // directory nobody chose.
+    let db_path = match db_path.or_else(|| env("UPLAND_DB_PATH")) {
+        Some(value) if value.trim().is_empty() => {
+            return Err("not a database path: the value must not be empty".to_owned());
+        }
+        Some(value) => PathBuf::from(value),
+        None => default_db_path(env)?,
+    };
 
-    Ok((host, port.unwrap_or(DEFAULT_PORT)))
+    Ok((host, port.unwrap_or(DEFAULT_PORT), db_path))
 }
 
 impl Config {
@@ -160,8 +222,12 @@ impl Config {
         S: Into<String>,
         E: Fn(&str) -> Option<String>,
     {
-        let (host, port) = host_and_port(args, &env)?;
-        Ok(Self { host, port })
+        let (host, port, db_path) = bind_and_storage(args, &env)?;
+        Ok(Self {
+            host,
+            port,
+            db_path,
+        })
     }
 }
 
@@ -193,7 +259,7 @@ mod tests {
             eprintln!("SKIPPING: web/dist is built; the SPA fallback owns unknown paths");
             return;
         }
-        let server = TestServer::new(router());
+        let server = TestServer::new(router(test_state().await));
         server
             .get("/nope")
             .await
@@ -207,6 +273,63 @@ mod tests {
         let config = crate::Config::from_args(Vec::<String>::new(), env(&[])).expect("defaults");
         assert_eq!(config.host, "127.0.0.1");
         assert_eq!(config.port, 8080);
+        // The default database path is a per-user location, not the working
+        // directory: every launcher would otherwise own the answer to "which
+        // database did I just open" differently.
+        assert_eq!(config.db_path.file_name().unwrap(), "upland.db");
+    }
+
+    #[test]
+    fn the_default_database_path_follows_the_platform_data_directory() {
+        #[cfg(target_os = "macos")]
+        let expected =
+            std::path::Path::new("/home/tester/Library/Application Support/upland/upland.db");
+        #[cfg(target_os = "windows")]
+        let expected =
+            std::path::Path::new("C:\\Users\\tester\\AppData\\Roaming\\upland\\upland.db");
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let expected = std::path::Path::new("/home/tester/.local/share/upland/upland.db");
+
+        let config = crate::Config::from_args(Vec::<String>::new(), env(&[])).expect("defaults");
+        assert_eq!(config.db_path, expected);
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    fn xdg_data_home_wins_over_the_local_share_fallback() {
+        let config = crate::Config::from_args(
+            Vec::<String>::new(),
+            env(&[("XDG_DATA_HOME", "/srv/upland-data")]),
+        )
+        .expect("xdg");
+        assert_eq!(
+            config.db_path,
+            std::path::Path::new("/srv/upland-data/upland/upland.db")
+        );
+    }
+
+    #[test]
+    fn the_database_path_flag_and_environment_are_honoured() {
+        let from_flag = crate::Config::from_args(
+            vec!["--db-path".to_string(), "/tmp/flag.db".to_string()],
+            env(&[("UPLAND_DB_PATH", "/tmp/env.db")]),
+        )
+        .expect("flag");
+        assert_eq!(from_flag.db_path, std::path::Path::new("/tmp/flag.db"));
+
+        let from_env = crate::Config::from_args(
+            Vec::<String>::new(),
+            env(&[("UPLAND_DB_PATH", "/tmp/env.db")]),
+        )
+        .expect("env");
+        assert_eq!(from_env.db_path, std::path::Path::new("/tmp/env.db"));
+
+        // An empty UPLAND_DB_PATH is a failure, not a quiet default: the
+        // operator wrote a path here and losing it silently is how the wrong
+        // database gets opened.
+        let error = crate::Config::from_args(Vec::<String>::new(), env(&[("UPLAND_DB_PATH", "")]))
+            .expect_err("must fail");
+        assert!(error.contains("database path"), "{error}");
     }
 
     #[test]
@@ -372,9 +495,11 @@ mod tests {
         for expected in [
             "--host",
             "--port",
+            "--db-path",
             "--version",
             "--help",
             "UPLAND_PORT",
+            "UPLAND_DB_PATH",
             "127.0.0.1",
         ] {
             assert!(usage.contains(expected), "usage omits {expected}");
@@ -387,6 +512,27 @@ mod tests {
                 .iter()
                 .find(|(name, _)| *name == key)
                 .map(|(_, value)| (*value).to_owned())
+                .or_else(|| match key {
+                    // Config::from_args resolves a default database path from
+                    // the environment, and these tests mostly assert about
+                    // other keys; the launcher variable for the current
+                    // platform is present unless a test overrides it.
+                    #[cfg(target_os = "windows")]
+                    "APPDATA" => Some("C:\\Users\\tester\\AppData\\Roaming".to_owned()),
+                    #[cfg(not(target_os = "windows"))]
+                    "HOME" => Some("/home/tester".to_owned()),
+                    _ => None,
+                })
+        }
+    }
+
+    async fn test_state() -> crate::AppState {
+        crate::AppState {
+            db: std::sync::Arc::new(
+                crate::db::Db::in_memory()
+                    .await
+                    .expect("in-memory test database"),
+            ),
         }
     }
 }

@@ -18,6 +18,18 @@ names code, issues, tests, workflows and ADRs must use.
   `rust-embed` at release compile time. A target's binary and its bundle are
   one artifact; there is no separate frontend deployment.
 
+## Persistence
+
+- **database** — the single SQLite file upland opens at startup, through
+  SQLx with one writer connection and a read pool (ADR-0003). It is opened
+  before the **listen address** is bound and fails the start if it cannot
+  be opened. **store**, **datastore** and **cache** are not the term.
+- **database path** — the location of the **database**: `--db-path` or
+  `UPLAND_DB_PATH`, defaulting to the platform's per-user data directory
+  (`upland/upland.db`), never the working directory (ADR-0003). The
+  gateway's first tables — credentials, logs, analytics, sessions — land
+  under it in their own migrations when the features that need them arrive.
+
 ## Artifacts
 
 - **target** — one of `darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`,
