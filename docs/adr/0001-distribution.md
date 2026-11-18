@@ -71,6 +71,13 @@ verifies a checksum, never that a binary starts on the user's libc.
   names. The tap's contract is about the name, not the libc inside it, and the
   name the tap renders a URL for is the one an Ubuntu 20.04 or Alpine host can
   actually start. No glibc **release asset** is published beside it.
+- The two musl targets build with `cargo zigbuild`, not `cargo build`. Bundled
+  SQLite is C and the static link needs a compiler for the musl triple, which
+  the Ubuntu runners do not ship: the first release failed in `libsqlite3-sys`'s
+  build script looking for `x86_64-linux-musl-gcc`. `zig cc` is the compiler and
+  linker for both, and `scripts/install-musl-toolchain.sh` pins zig and
+  cargo-zigbuild by version and sha256 rather than following an upstream
+  "latest".
 - `darwin-x64` builds with `MACOSX_DEPLOYMENT_TARGET=11.0`; `darwin-arm64`
   keeps 14.0. The Intel floor is the point of having the target at all.
 - Each build job runs the binary it just produced with `--version` and compares
@@ -110,6 +117,9 @@ verifies a checksum, never that a binary starts on the user's libc.
   downloads, so the four **tarball assets** of one release embed identical
   frontend bytes and `bun install` runs once per release instead of once per
   target.
+- The `build` jobs install `scripts/install-musl-toolchain.sh` only for the rows
+  whose rust target triple ends in `-musl`; every other row builds with `cargo`
+  alone, so the C cross-toolchain stays out of the darwin and Windows paths.
 - `package` (Ubuntu, GNU tar) renames, packs and checksums; `github-release`
   uploads exactly what `package` produced; `tap` then dispatches the bump and
   polls it. A failed bump fails the release. The job's verdict is not the run's
@@ -184,20 +194,30 @@ verifies a checksum, never that a binary starts on the user's libc.
   first CI run of the `packaging` job on an Ubuntu runner reported
   `28 checks, 0 failures` (run 44263254904), where the local pre-merge run had
   used an emulator that writes those header fields faithfully and refuses
-  nothing. Still not proven: that a musl link succeeds on the runners, and that
-  `brew fetch --all-platforms`, `brew audit --strict --online`, `brew install`
-  and `brew test upland` pass — both need a release, so they belong to the
-  first one.
-- Nothing breaks for existing users, because there are none: no tag, no release
-  and no download of `upland-<os>-<arch>.tar.gz` ever existed. `README.md`
-  documented a naming scheme that was never published, which is why changing it
-  cost nothing.
-- One build now feeds four tarballs from one Linux host, so a musl link failure
-  shows up as a red **build** job on the target that hit it, and the answer is
-  `cargo zigbuild`, never a quiet switch back to gnu.
+  nothing. The musl link went the other way first: both Linux targets failed in
+  `libsqlite3-sys` for want of `x86_64-linux-musl-gcc`, in run 44263923181 and
+  again in 44268008447, and the zigbuild path this ADR now records is the
+  answer — proven on a Linux arm64 host, where it compiles the bundled SQLite,
+  links both musl triples statically and runs the native one, and proven on
+  the runners by run 44269180557, a probe that mirrored the build job's steps
+  outside a release. What a release has not done is build this way yet. Also
+  still unproven: that `brew fetch --all-platforms`, `brew audit --strict
+  --online`, `brew install` and `brew test upland` pass — both runs died before
+  `github-release` ran, so those belong to the next one too.
+- Nothing breaks for existing users, because there are none: releases #1 and #2
+  pushed the `v0.1.1` and `v0.1.2` tags and died in the Linux builds, so no
+  release and no download of `upland-<os>-<arch>.tar.gz` ever existed.
+  `README.md` documented a naming scheme that was never published, which is why
+  changing it cost nothing.
+- One build now feeds four tarballs from one Linux host, so a musl failure
+  shows up as a red **build** job on the target that hit it. It is repaired at
+  the pin in `scripts/install-musl-toolchain.sh`, never by a quiet switch back
+  to gnu, which would silently raise the glibc floor the musl name exists to
+  avoid.
 - `linux-arm64` builds on `ubuntu-24.04-arm`, a GitHub-hosted arm64 runner:
-  free for public repositories, native, so no cross linker and no container
-  toolchain in the release path.
+  free for public repositories, native, so no container toolchain in the
+  release path. It still needs zig cc, because a native arm64 Ubuntu runner has
+  no musl libc to compile or link against either.
 - A release is now longer than the sum of its builds: the tap's bump runs on a
   macOS runner because `brew` is not on the PATH of Ubuntu ones, and the
   release waits for it. A tap-side push failure stops a release, and is
@@ -238,6 +258,10 @@ verifies a checksum, never that a binary starts on the user's libc.
 - **`cross` with docker for linux-arm64.** Reproducible, and a musl sweep would
   be easier later, but it puts a docker daemon in the release path when GitHub
   ships a native arm64 runner for public repositories.
+- **apt's `musl-tools` on each Linux runner.** Cheaper than a pinned zig, and
+  it does ship a `musl-gcc` for the runner's own arch, but the musl version
+  then belongs to the runner image instead of to this repository, and a
+  triple-to-arch coincidence is not a toolchain contract.
 - **A Bun/TypeScript packer copied from limulin.** Byte-determinism was the
   property worth copying, not the runtime: it costs a root `package.json`, a
   lockfile and a Bun toolchain in a repository whose only TypeScript is a

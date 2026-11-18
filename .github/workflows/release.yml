@@ -163,10 +163,26 @@ jobs:
         if: matrix.rosetta
         run: sudo softwareupdate --install-rosetta --agree-to-license
 
+      # Bundled SQLite is C, and a static musl link needs a C compiler for the
+      # musl triple: the Ubuntu runners have neither x86_64-linux-musl-gcc nor
+      # aarch64-linux-musl-gcc, so the musl targets build through zig cc, which
+      # cargo zigbuild passes to the compile and the link alike (ADR-0001).
+      - name: Install the musl toolchain
+        if: endsWith(matrix.rustTarget, '-musl')
+        run: bash scripts/install-musl-toolchain.sh
+
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.rustTarget }}
+        shell: bash
         env:
+          RUST_TARGET: ${{ matrix.rustTarget }}
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deploymentTarget }}
+        run: |
+          set -euo pipefail
+          case "$RUST_TARGET" in
+            *-musl) set -- cargo zigbuild ;;
+            *) set -- cargo build ;;
+          esac
+          "$@" --release --locked --target "$RUST_TARGET"
 
       - name: Smoke (Unix)
         if: runner.os != 'Windows'
