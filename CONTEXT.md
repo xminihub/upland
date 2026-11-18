@@ -29,8 +29,38 @@ names code, issues, tests, workflows and ADRs must use.
 - **database path** — the location of the **database**: `--db-path` or
   `UPLAND_DB_PATH`, defaulting to the platform's per-user data directory
   (`upland/upland.db`), never the working directory (ADR-0003). The
-  gateway's first tables — credentials, logs, analytics, sessions — land
-  under it in their own migrations when the features that need them arrive.
+  gateway's first tables — credentials, logs, analytics — land under it in
+  their own migrations when the features that need them arrive.
+
+## Authentication
+
+- **account** — the person a request authenticates as: a username and an
+  email, both stored lowercased and unique. Created at signup or, through
+  an OIDC **provider**, silently at first login. **user** is not the term
+  in code and issues; **principal** never was.
+- **credential** — an account's bcrypt hash row, the one place a password
+  is kept; an account that arrived by OIDC alone has none. The reserved
+  table of ADR-0003 keeps this exact meaning.
+- **identity** — an (issuer, subject) pair an OIDC login arrived with,
+  attached to exactly one account. **provider name** is how the login
+  screen and the API refer to it.
+- **access token** — the stateless HS256 JWT a signed-in caller sends as
+  `Authorization: Bearer`; nothing else opens the API (ADR-0004). It
+  expires; it is never refreshed; logout forgets one rather than revoking
+  it. **session** is not the term and there is no sessions table.
+- **signing secret** — the random key in the **config file** that mints
+  and verifies **access token**s; generated at first boot, owned by the
+  operator from then on, and replacing it revokes every token.
+- **provider** — an OIDC provider the operator configured: a name
+  (`[a-z0-9-]`, quoted forever in payloads), an issuer URL and a client id.
+  No client secret is stored server-side.
+- **config file** — the JSON document holding everything the server reads
+  at boot beyond the CLI surface (ADR-0005): the `server` and `auth`
+  sections, generated with safe defaults on first boot. **store** and
+  **settings** are not the term.
+- **config path** — the location of the **config file**: `--config` or
+  `UPLAND_CONFIG`, defaulting to `upland/config.json` in the same per-user
+  data directory as the **database path**.
 
 ## Artifacts
 
