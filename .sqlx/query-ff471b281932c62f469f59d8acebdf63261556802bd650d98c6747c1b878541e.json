@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT account_id FROM identities WHERE issuer = ? AND subject = ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "account_id",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "identities",
+            "name": "account_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ff471b281932c62f469f59d8acebdf63261556802bd650d98c6747c1b878541e"
+}

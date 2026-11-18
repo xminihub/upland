@@ -13,6 +13,8 @@ async fn test_server() -> TestServer {
             .expect("test secret"),
             3600,
         ),
+        oidc_providers: vec![],
+        id_tokens: upland::oidc::IdTokenValidator::Fixed(Default::default()),
     }))
 }
 

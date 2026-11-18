@@ -51,6 +51,8 @@ async fn main() -> ExitCode {
             config.signing_secret,
             config.ttl_seconds,
         ),
+        oidc_providers: config.oidc_providers,
+        id_tokens: upland::oidc::IdTokenValidator::Live,
     };
     axum::serve(listener, upland::router(state))
         .await

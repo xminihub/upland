@@ -19,6 +19,7 @@ use crate::auth::AccessTokenIssuer;
 
 pub mod auth;
 pub mod db;
+pub mod oidc;
 
 use auth::SigningSecret;
 use db::Db;
@@ -41,6 +42,11 @@ pub struct AppState {
     /// secret** and TTL arrive once from the **config file**, never from a
     /// handler.
     pub access_tokens: AccessTokenIssuer,
+    /// The configured **provider**s (ADR-0005), names validated at boot.
+    pub oidc_providers: Vec<OidcProvider>,
+    /// The ID-token verification boundary (ADR-0004): live against the
+    /// configured issuers in production, fixtures in tests.
+    pub id_tokens: oidc::IdTokenValidator,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -69,7 +75,9 @@ async fn spa_fallback(uri: Uri) -> Response {
 fn api(state: AppState) -> Router<AppState> {
     let public = Router::new()
         .route("/auth/signup", post(signup))
-        .route("/auth/login", post(login));
+        .route("/auth/login", post(login))
+        .route("/auth/oidc", post(oidc_exchange))
+        .route("/auth/providers", get(providers));
     let guarded = Router::new()
         .route("/hello", get(hello))
         .route("/auth/me", get(me))
@@ -419,6 +427,228 @@ async fn me(
 /// nothing, and the API says so rather than pretending.
 async fn logout(Authenticated(_claims): Authenticated) -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(json!({ "ok": true })))
+}
+
+/// The exempt read the login screen needs before anyone has credentials
+/// (ADR-0004): which doors exist, and what the browser needs to knock on
+/// them directly — issuer and client id, never a secret.
+async fn providers(State(state): State<AppState>) -> Json<Value> {
+    let listing = state
+        .oidc_providers
+        .iter()
+        .map(|provider| {
+            json!({
+                "name": provider.name,
+                "issuer": provider.issuer,
+                "client_id": provider.client_id,
+            })
+        })
+        .collect::<Vec<Value>>();
+    Json(json!(listing))
+}
+
+#[derive(serde::Deserialize)]
+struct OidcBody {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    nonce: Option<String>,
+}
+
+/// The second door (ADR-0004): the SPA's PKCE result is verified against
+/// the configured issuer, and the account it names — matched by email,
+/// created if novel — receives an upland token like any other login.
+async fn oidc_exchange(
+    State(state): State<AppState>,
+    payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let Ok(Json(body)) = payload else {
+        return invalid(None);
+    };
+    let Ok(parsed) = serde_json::from_value::<OidcBody>(body) else {
+        return invalid(None);
+    };
+    let Some(provider_name) = parsed.provider else {
+        return invalid(Some("provider"));
+    };
+    let Some(id_token) = parsed.id_token else {
+        return invalid(Some("id_token"));
+    };
+    let Some(provider) = state
+        .oidc_providers
+        .iter()
+        .find(|candidate| candidate.name == provider_name)
+        .cloned()
+    else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": { "code": "provider_unknown", "field": "provider" } })),
+        );
+    };
+
+    let Ok(identity) = state
+        .id_tokens
+        .validate(&provider, &id_token, parsed.nonce.as_deref())
+        .await
+    else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": { "code": "oidc_rejected" } })),
+        );
+    };
+
+    // The identity has signed in before: its account, directly.
+    if let Ok(Some(row)) = sqlx::query!(
+        "SELECT account_id FROM identities WHERE issuer = ? AND subject = ?",
+        provider.issuer,
+        identity.subject
+    )
+    .fetch_optional(state.db.reader())
+    .await
+    {
+        return token_for(&state, row.account_id).await;
+    }
+
+    // Email is the linking key, verified claim or not (ADR-0004); with no
+    // email asserted there is nothing to link by, and the provider simply
+    // does not get an account.
+    let Some(email) = identity
+        .email
+        .as_deref()
+        .map(|email| email.trim().to_lowercase())
+    else {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({ "error": { "code": "provider_no_email" } })),
+        );
+    };
+
+    if let Ok(Some(row)) = sqlx::query!("SELECT id FROM accounts WHERE email = ?", email)
+        .fetch_optional(state.db.reader())
+        .await
+    {
+        if sqlx::query!(
+            "INSERT INTO identities (provider_name, issuer, subject, account_id) VALUES (?, ?, ?, ?)",
+            provider.name,
+            provider.issuer,
+            identity.subject,
+            row.id
+        )
+        .execute(state.db.writer())
+        .await
+        .is_err()
+        {
+            return internal();
+        }
+        return token_for(&state, row.id).await;
+    }
+
+    let base = derived_username(&email);
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after 1970")
+        .as_secs() as i64;
+    for attempt in 0..100u32 {
+        let username = candidate_username(&base, attempt);
+        let inserted = sqlx::query!(
+            "INSERT INTO accounts (username, email, created_at) VALUES (?, ?, ?) RETURNING id",
+            username,
+            email,
+            created_at
+        )
+        .fetch_one(state.db.writer())
+        .await;
+        match inserted {
+            Ok(row) => {
+                if sqlx::query!(
+                    "INSERT INTO identities (provider_name, issuer, subject, account_id) VALUES (?, ?, ?, ?)",
+                    provider.name,
+                    provider.issuer,
+                    identity.subject,
+                    row.id
+                )
+                .execute(state.db.writer())
+                .await
+                .is_err()
+                {
+                    let _ = sqlx::query!("DELETE FROM accounts WHERE id = ?", row.id)
+                        .execute(state.db.writer())
+                        .await;
+                    return internal();
+                }
+                return token_for(&state, row.id).await;
+            }
+            Err(error) => {
+                let taken_by_username = error.to_string().contains("accounts.username");
+                let taken_by_email = error.to_string().contains("accounts.email");
+                if taken_by_username {
+                    continue;
+                }
+                if taken_by_email {
+                    // Raced with a password signup of the same email:
+                    // link to that account instead of failing.
+                    if let Ok(Some(row)) =
+                        sqlx::query!("SELECT id FROM accounts WHERE email = ?", email)
+                            .fetch_optional(state.db.reader())
+                            .await
+                    {
+                        let _ = sqlx::query!(
+                            "INSERT INTO identities (provider_name, issuer, subject, account_id) VALUES (?, ?, ?, ?)",
+                            provider.name,
+                            provider.issuer,
+                            identity.subject,
+                            row.id
+                        )
+                        .execute(state.db.writer())
+                        .await;
+                        return token_for(&state, row.id).await;
+                    }
+                }
+                return internal();
+            }
+        }
+    }
+    internal()
+}
+
+async fn token_for(state: &AppState, account_id: i64) -> (StatusCode, Json<Value>) {
+    match state.access_tokens.mint(&account_id.to_string()) {
+        Ok(token) => (StatusCode::OK, Json(json!({ "access_token": token }))),
+        Err(_) => internal(),
+    }
+}
+
+/// The handle an OIDC account is born with (ADR-0004): the email's local
+/// part, sanitized to the username rules. The person never chose it; a
+/// future rename feature will let them.
+fn derived_username(email: &str) -> String {
+    let local = email.split('@').next().unwrap_or(email);
+    let sanitized: String = local
+        .chars()
+        .filter(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '.' || *c == '-' || *c == '_'
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches(|c| c == '.' || c == '-' || c == '_');
+    if trimmed.is_empty() {
+        "oidc".to_owned()
+    } else {
+        trimmed.chars().take(28).collect()
+    }
+}
+
+fn candidate_username(base: &str, attempt: u32) -> String {
+    if attempt == 0 {
+        base.to_owned()
+    } else {
+        // Suffixes count from -2: "grace" taken yields "grace-2", never
+        // "grace-1" beside a name that never had a suffix to begin with.
+        let suffix = format!("-{}", attempt + 1);
+        let keep = 32usize.saturating_sub(suffix.len());
+        format!("{}{}", base.chars().take(keep).collect::<String>(), suffix)
+    }
 }
 
 async fn api_not_found() -> (StatusCode, Json<Value>) {
@@ -788,6 +1018,30 @@ where
         Some(ttl_seconds) => ttl_seconds,
         None => DEFAULT_TTL_SECONDS,
     };
+    // Provider names are quoted in API payloads and bookmarks forever
+    // (ADR-0005): one charset, no duplicates, decided at the boot that
+    // reads them rather than at the request that first trips over them.
+    let mut seen_names = std::collections::HashSet::new();
+    for provider in &file.auth.oidc_providers {
+        let valid = !provider.name.is_empty()
+            && provider.name.len() <= 32
+            && provider
+                .name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !valid {
+            return Err(format!(
+                "config file auth.oidc_providers: invalid provider name {:?}",
+                provider.name
+            ));
+        }
+        if !seen_names.insert(provider.name.clone()) {
+            return Err(format!(
+                "config file auth.oidc_providers: duplicate provider name {:?}",
+                provider.name
+            ));
+        }
+    }
 
     Ok(Config {
         host,
@@ -1411,6 +1665,44 @@ mod tests {
     }
 
     #[test]
+    fn provider_names_are_validated_at_the_boot_that_reads_them() {
+        let secret =
+            "\"jwt_secret\": \"abababababababababababababababababababababababababababababababab\"";
+        let entry = |name: &str| {
+            format!(
+                "{{ \"auth\": {{ {secret}, \"oidc_providers\": [ {{ \"name\": \"{name}\", \"issuer\": \"https://e\", \"client_id\": \"c\" }} ] }} }}"
+            )
+        };
+        let cases = [
+            ("Bad Name", "invalid provider name"),
+            (&"a".repeat(33), "invalid provider name"),
+            ("", "invalid provider name"),
+        ];
+        for (name, needle) in cases {
+            let error = crate::Config::from_args_with(
+                vec!["--config".to_string(), "/tmp/upname.json".to_string()],
+                env(&[]),
+                fs(&[("/tmp/upname.json", &entry(name))]),
+            )
+            .expect_err("must fail");
+            assert!(error.contains(needle), "{name:?} produced {error}");
+        }
+
+        let duplicated = format!(
+            "{{ \"auth\": {{ {secret}, \"oidc_providers\": [ \
+             {{ \"name\": \"same\", \"issuer\": \"https://one\", \"client_id\": \"c\" }}, \
+             {{ \"name\": \"same\", \"issuer\": \"https://two\", \"client_id\": \"c\" }} ] }} }}"
+        );
+        let error = crate::Config::from_args_with(
+            vec!["--config".to_string(), "/tmp/updup.json".to_string()],
+            env(&[]),
+            fs(&[("/tmp/updup.json", &duplicated)]),
+        )
+        .expect_err("must fail");
+        assert!(error.contains("duplicate provider name"), "{error}");
+    }
+
+    #[test]
     fn a_config_never_prints_its_signing_secret() {
         let config = crate::Config::from_args_with(
             vec!["--config".to_string(), "/tmp/updebug.json".to_string()],
@@ -1549,6 +1841,8 @@ mod tests {
                 .expect("test secret"),
                 3600,
             ),
+            oidc_providers: vec![],
+            id_tokens: crate::oidc::IdTokenValidator::Fixed(Default::default()),
         }
     }
 }
