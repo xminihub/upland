@@ -67,23 +67,43 @@ async fn spa_fallback(uri: Uri) -> Response {
 }
 
 fn api(state: AppState) -> Router<AppState> {
-    let public = Router::new().route("/auth/signup", post(signup));
+    let public = Router::new()
+        .route("/auth/signup", post(signup))
+        .route("/auth/login", post(login));
     let guarded = Router::new()
         .route("/hello", get(hello))
+        .route("/auth/me", get(me))
+        .route("/auth/logout", post(logout))
         .route_layer(from_fn_with_state(state, require_bearer));
     Router::new()
         .nest("/v1", public.merge(guarded).fallback(api_not_found))
         .fallback(api_not_found)
 }
 
-/// The bearer middleware (ADR-0004): a token must verify with the signing
-/// secret and name an account that still exists. Every failure answers the
-/// same `unauthorized` code — the API does not explain which half of a
-/// guess was wrong.
+/// The verified **access token**'s claims, published to handlers by the
+/// bearer middleware through the request's extensions.
+#[derive(Clone)]
+pub struct Authenticated(pub auth::Claims);
+
+impl axum::extract::FromRequestParts<AppState> for Authenticated {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Authenticated>()
+            .cloned()
+            .ok_or_else(unauthorized_pair)
+    }
+}
+
 async fn require_bearer(
     State(state): State<AppState>,
     headers: HeaderMap,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     let bearer = headers
@@ -102,17 +122,24 @@ async fn require_bearer(
         .fetch_optional(state.db.reader())
         .await;
     match alive {
-        Ok(Some(_)) => next.run(request).await,
+        Ok(Some(_)) => {
+            request.extensions_mut().insert(Authenticated(claims));
+            next.run(request).await
+        }
         _ => unauthorized(),
     }
 }
 
+fn unauthorized_body() -> Value {
+    json!({ "error": { "code": "unauthorized" } })
+}
+
+fn unauthorized_pair() -> (StatusCode, Json<Value>) {
+    (StatusCode::UNAUTHORIZED, Json(unauthorized_body()))
+}
+
 fn unauthorized() -> Response {
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(json!({ "error": { "code": "unauthorized" } })),
-    )
-        .into_response()
+    unauthorized_pair().into_response()
 }
 
 #[derive(serde::Deserialize)]
@@ -285,6 +312,113 @@ fn invalid(field: Option<&str>) -> (StatusCode, Json<Value>) {
         None => json!({ "error": { "code": "invalid" } }),
     };
     (StatusCode::UNPROCESSABLE_ENTITY, Json(error))
+}
+
+#[derive(serde::Deserialize)]
+struct LoginBody {
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+/// Passwords fail for one reason only: the pair does not verify. Whether
+/// the username exists, whether it has a credential at all (ADR-0004
+/// lets OIDC-only accounts exist), and whether the password was merely
+/// wrong all answer the same 401 — the door does not explain the lock.
+async fn login(
+    State(state): State<AppState>,
+    payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let Ok(Json(body)) = payload else {
+        return invalid(None);
+    };
+    let Ok(parsed) = serde_json::from_value::<LoginBody>(body) else {
+        return invalid(None);
+    };
+    let Some(username) = parsed.username else {
+        return invalid(Some("username"));
+    };
+    let Some(password) = parsed.password else {
+        return invalid(Some("password"));
+    };
+
+    let username = username.trim().to_lowercase();
+    let account = sqlx::query!("SELECT id FROM accounts WHERE username = ?", username)
+        .fetch_optional(state.db.reader())
+        .await
+        .ok()
+        .flatten();
+    let Some(account) = account else {
+        return unauthorized_pair();
+    };
+    let credential = sqlx::query!(
+        "SELECT password_hash FROM credentials WHERE account_id = ?",
+        account.id
+    )
+    .fetch_optional(state.db.reader())
+    .await
+    .ok()
+    .flatten();
+    let Some(credential) = credential else {
+        return unauthorized_pair();
+    };
+
+    let checking =
+        tokio::task::spawn_blocking(move || bcrypt::verify(&password, &credential.password_hash));
+    let verified = matches!(checking.await, Ok(Ok(true)));
+    if !verified {
+        return unauthorized_pair();
+    }
+
+    match state.access_tokens.mint(&account.id.to_string()) {
+        Ok(token) => (StatusCode::OK, Json(json!({ "access_token": token }))),
+        Err(_) => internal(),
+    }
+}
+
+async fn me(
+    State(state): State<AppState>,
+    Authenticated(claims): Authenticated,
+) -> (StatusCode, Json<Value>) {
+    let Ok(account_id) = claims.sub.parse::<i64>() else {
+        return unauthorized_pair();
+    };
+    let Ok(Some(account)) = sqlx::query!(
+        "SELECT id, username, email FROM accounts WHERE id = ?",
+        account_id
+    )
+    .fetch_optional(state.db.reader())
+    .await
+    else {
+        return unauthorized_pair();
+    };
+    let identities = sqlx::query!(
+        "SELECT provider_name FROM identities WHERE account_id = ? ORDER BY provider_name",
+        account_id
+    )
+    .fetch_all(state.db.reader())
+    .await
+    .unwrap_or_default();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": account.id,
+            "username": account.username,
+            "email": account.email,
+            "identities": identities
+                .iter()
+                .map(|row| row.provider_name.clone())
+                .collect::<Vec<String>>(),
+        })),
+    )
+}
+
+/// The client's forget ritual (ADR-0004): stateless logout revokes
+/// nothing, and the API says so rather than pretending.
+async fn logout(Authenticated(_claims): Authenticated) -> (StatusCode, Json<Value>) {
+    (StatusCode::OK, Json(json!({ "ok": true })))
 }
 
 async fn api_not_found() -> (StatusCode, Json<Value>) {

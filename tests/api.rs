@@ -311,3 +311,139 @@ async fn signup_stores_only_the_hash_and_lowercase_handles() {
     assert!(row.2.starts_with("$2b$12$"), "{}", row.2);
     assert!(!row.2.contains("hunter2"));
 }
+
+async fn login(server: &TestServer, username: &str, password: &str) -> TestResponse {
+    server
+        .post("/api/v1/auth/login")
+        .json(&json!({ "username": username, "password": password }))
+        .await
+}
+
+fn bearer(token: &str) -> String {
+    format!("Bearer {token}")
+}
+
+#[tokio::test]
+async fn login_answers_a_working_access_token() {
+    let server = test_server().await;
+    signup(&server, "Reta", "reta@example.com", "hunter2").await;
+
+    let response = login(&server, "reta", "hunter2").await;
+    response.assert_status_ok();
+    let token = response.json::<Value>()["access_token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    server
+        .get("/api/v1/hello")
+        .add_header("authorization", bearer(&token))
+        .await
+        .assert_status_ok();
+}
+
+#[tokio::test]
+async fn login_refuses_unknown_users_and_wrong_passwords_identically() {
+    let server = test_server().await;
+    signup(&server, "Known", "known@example.com", "hunter2").await;
+
+    let unknown = login(&server, "nobody", "hunter2").await;
+    let wrong = login(&server, "known", "wrong-one").await;
+    for response in [unknown, wrong] {
+        response.assert_status_unauthorized();
+        assert_eq!(
+            response.json::<Value>(),
+            json!({ "error": { "code": "unauthorized" } })
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_account_without_a_password_door_still_401s_by_name() {
+    // OIDC-created accounts have no credentials row (ADR-0004); a password
+    // login must fail them exactly like every other failure.
+    let state = test_state().await;
+    let server = TestServer::new(upland::router(state.clone()));
+    signup(&server, "Passwordless", "pless@example.com", "hunter2")
+        .await
+        .assert_status_ok();
+    sqlx::query!("DELETE FROM credentials WHERE account_id = 1")
+        .execute(state.db.writer())
+        .await
+        .expect("drop the credential");
+
+    let response = login(&server, "passwordless", "hunter2").await;
+    response.assert_status_unauthorized();
+    assert_eq!(
+        response.json::<Value>(),
+        json!({ "error": { "code": "unauthorized" } })
+    );
+}
+
+#[tokio::test]
+async fn login_body_that_omits_a_field_names_it() {
+    let server = test_server().await;
+    let response = server
+        .post("/api/v1/auth/login")
+        .json(&json!({ "username": "someone" }))
+        .await;
+    response.assert_status(StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        response.json::<Value>(),
+        json!({ "error": { "code": "invalid", "field": "password" } })
+    );
+}
+
+#[tokio::test]
+async fn me_answers_the_account_it_was_minted_for() {
+    let server = test_server().await;
+    let signup = signup(&server, "Tess", "Tess@Example.com", "hunter2").await;
+    let token = signup.json::<Value>()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let anonymous = server.get("/api/v1/auth/me").await;
+    anonymous.assert_status_unauthorized();
+
+    let response = server
+        .get("/api/v1/auth/me")
+        .add_header("authorization", bearer(&token))
+        .await;
+    response.assert_status_ok();
+    assert_eq!(
+        response.json::<Value>(),
+        json!({
+            "id": 1,
+            "username": "tess",
+            "email": "tess@example.com",
+            "identities": []
+        })
+    );
+}
+
+#[tokio::test]
+async fn logout_requires_a_token_and_revokes_nothing_but_forgives_nothing() {
+    let server = test_server().await;
+    server
+        .post("/api/v1/auth/logout")
+        .await
+        .assert_status_unauthorized();
+
+    let signup = signup(&server, "Leaver", "leaver@example.com", "hunter2").await;
+    let token = signup.json::<Value>()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    server
+        .post("/api/v1/auth/logout")
+        .add_header("authorization", bearer(&token))
+        .await
+        .assert_status_ok();
+
+    // The honest half of stateless: the token outlives the logout.
+    server
+        .get("/api/v1/hello")
+        .add_header("authorization", bearer(&token))
+        .await
+        .assert_status_ok();
+}

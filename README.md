@@ -39,8 +39,19 @@ cargo sqlx prepare                                               # after changes
 
 ## Endpoints
 
-- `GET /api/v1/hello` — hello message
-- `GET /healthz` — health check
+Everything under `/api/v1` requires `Authorization: Bearer <access token>`
+except the four doors that open it: signup, login, the OIDC exchange and
+the provider listing. Logout is honest theatre: stateless tokens are not
+revoked, clients simply forget them (ADR-0004).
+
+- `GET /api/v1/hello` — hello message (requires a token)
+- `POST /api/v1/auth/signup` — create an account, answer an access token
+- `POST /api/v1/auth/login` — username and password, answer an access token
+- `POST /api/v1/auth/oidc` — exchange an ID token from a configured provider
+- `GET /api/v1/auth/providers` — the configured providers, no token needed
+- `GET /api/v1/auth/me` — the account the token was minted for
+- `POST /api/v1/auth/logout` — forget-the-token ritual, revokes nothing server-side
+- `GET /healthz` — health check, always open
 - `GET /` — single-page app (served from `web/dist`, embedded into the binary in release builds; when `web/dist` is empty the SPA routes are not mounted and the API works alone)
 
 ## Development

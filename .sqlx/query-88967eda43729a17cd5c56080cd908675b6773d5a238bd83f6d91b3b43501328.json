@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT provider_name FROM identities WHERE account_id = ? ORDER BY provider_name",
+  "describe": {
+    "columns": [
+      {
+        "name": "provider_name",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "identities",
+            "name": "provider_name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "88967eda43729a17cd5c56080cd908675b6773d5a238bd83f6d91b3b43501328"
+}
