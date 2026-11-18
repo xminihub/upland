@@ -180,13 +180,14 @@ verifies a checksum, never that a binary starts on the user's libc.
   real `lim` bump run, and the cross-repo contract: the tap's
   `scripts/render.mjs assets upland 0.1.1` and this repository's
   `scripts/asset-name.sh` print the same four names, and `brew style` finds no
-  offense in the rendered `Formula/upland.rb`. Not proven here: that GNU tar
-  itself accepts the flags the packer passes (the local run used an emulator that
-  writes those header fields faithfully and refuses nothing — real tar's verdict
-  is ci.yml's `packaging` job), that a musl link succeeds on the runners, and
-  that `brew fetch --all-platforms`, `brew audit --strict --online`,
-  `brew install` and `brew test upland` pass, which need published assets and so
-  belong to the first release.
+  offense in the rendered `Formula/upland.rb`. GNU tar itself then agreed: the
+  first CI run of the `packaging` job on an Ubuntu runner reported
+  `28 checks, 0 failures` (run 44263254904), where the local pre-merge run had
+  used an emulator that writes those header fields faithfully and refuses
+  nothing. Still not proven: that a musl link succeeds on the runners, and that
+  `brew fetch --all-platforms`, `brew audit --strict --online`, `brew install`
+  and `brew test upland` pass — both need a release, so they belong to the
+  first one.
 - Nothing breaks for existing users, because there are none: no tag, no release
   and no download of `upland-<os>-<arch>.tar.gz` ever existed. `README.md`
   documented a naming scheme that was never published, which is why changing it
