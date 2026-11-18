@@ -62,7 +62,14 @@ binary. Contract:
 
 - Target detection maps `uname -s`/`uname -m` onto the **target table**'s
   npm-convention names (darwin/linux × arm64/x64); anything else — including
-  Windows — is refused with a pointer to where its artifact lives.
+  Windows — is refused with a pointer to where its artifact lives. The
+  detection and the asset-name pattern are re-spelled in the script rather
+  than read from the table or `asset-name.sh`: the installer runs on a
+  machine that has no repository yet, so byte-for-byte standalone shipping
+  (the contract that makes the shown source the executed bytes) buys one
+  deliberate vocabulary duplication. The script names the table as its
+  source of truth; renaming a target there must be echoed here, and the
+  tap's `render.mjs` keeps the same obligation for its half.
 - Version: `UPLAND_VERSION` pins; otherwise one redirect hop on
   `releases/latest` names it, never an unauthenticated API call with its rate
   limit. The release-asset copy is versionless, so the pinned form is

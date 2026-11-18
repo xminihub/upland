@@ -22,7 +22,7 @@ All HTTP behavior is tested through the in-process router seam (see `tests/`); t
 Distribution (`scripts/`, shell + jq):
 
 - `scripts/targets.json` — the target table: the release matrix and every asset name derive from this one file
-- `scripts/asset-name.sh` — the only place an asset name is spelled
+- `scripts/asset-name.sh` — the only place an asset name is spelled *from the table*; the installer re-spells it inline (no repo on a user's machine) — a deliberate exception, see ADR-0006
 - `scripts/package-brew-tarball.sh` — one deterministic tarball per Homebrew target; needs GNU tar (`brew install gnu-tar`, then `TAR=gtar`)
 - `scripts/install-musl-toolchain.sh` — pins and installs zig and `cargo-zigbuild`, the C toolchain the two `*-musl` targets build the bundled SQLite and link with; `release.yml` runs it before those builds
 - `scripts/install.sh` — the **installer** (ADR-0006): POSIX sh, Linux/macOS, checksum-verified, installs to `~/.local/bin`; shipped byte-for-byte as the versionless `install.sh` release asset and deliberately ungated by CI — its first run against real assets is its first test

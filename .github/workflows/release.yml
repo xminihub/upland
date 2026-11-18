@@ -95,17 +95,10 @@ jobs:
       # The crate must ship what every other channel ships: the SPA bundle
       # staged by the frontend build above, the migrations, and the offline
       # query metadata. Asserted before the bump because a red release must
-      # leave no version to explain (ADR-0006).
+      # leave no version to explain (ADR-0006); the cargo job calls the same
+      # script again before publishing.
       - name: Assert the crate packaging
-        run: |
-          set -euo pipefail
-          listing="$(cargo package --list --allow-dirty)"
-          for want in web/dist/index.html migrations/ .sqlx/; do
-            printf '%s\n' "$listing" | grep -qF "$want" || {
-              echo "the packaged crate does not carry $want"
-              exit 1
-            }
-          done
+        run: bash scripts/assert-crate-packaging.sh
 
   release:
     name: Bump & Tag
@@ -434,19 +427,11 @@ jobs:
           path: web/dist
 
       # verify asserted this listing before the bump; it is asserted again
-      # because republishing assets is legal and republishing a registry
+      # here because republishing assets is legal and republishing a registry
       # version is not — a half-packed crate is the one mistake this
-      # pipeline could not undo (ADR-0006).
+      # pipeline could not undo (ADR-0006). Same script, one derivation.
       - name: Assert the crate packaging
-        run: |
-          set -euo pipefail
-          listing="$(cargo package --list --allow-dirty)"
-          for want in web/dist/index.html migrations/ .sqlx/; do
-            printf '%s\n' "$listing" | grep -qF "$want" || {
-              echo "the packaged crate does not carry $want"
-              exit 1
-            }
-          done
+        run: bash scripts/assert-crate-packaging.sh
 
       - name: Publish to crates.io
         env:
@@ -462,11 +447,16 @@ jobs:
           # repair contract is re-dispatch, and a re-dispatch cannot un- or
           # re-publish a registry version. The sparse index answers; a missing
           # crate answers as nothing-published, which is the first release.
+          # (jq without -e: `-e` exits 1 when the test is false, which
+          # `set -e` here would take as the very failure it is testing for.)
           index="$(curl -fsS https://index.crates.io/up/la/upland || true)"
-          published="$(printf '%s' "$index" | jq -es --arg v "$VERSION" 'any(.[]; .vers == $v)')"
+          published="$(printf '%s' "$index" | jq -s --arg v "$VERSION" 'any(.[]; .vers == $v)')"
           if [ "$published" = "true" ]; then
             echo "::notice::upland $VERSION is already on crates.io — publish skipped"
           else
-            cargo publish --locked --allow-dirty
+            # No --allow-dirty: a published version is forever, and the
+            # registry must only ever hold what a clean tag checkout produced
+            # — the staged web-dist is gitignored and cannot dirty this tree.
+            cargo publish --locked
           fi
 

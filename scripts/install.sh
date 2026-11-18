@@ -39,6 +39,7 @@ usage() {
   say "the release's SHA256SUMS before anything moves."
 }
 
+: "${HOME:?HOME is not set; pass --bin-dir explicitly}"
 bin_dir="${HOME}/.local/bin"
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -61,11 +62,22 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# Make the destination absolute before it is used: the PATH check below is a
+# substring test, and a relative --bin-dir would silently install into a
+# surprise relative to whatever the caller's cwd happens to be.
+case "$bin_dir" in
+  /*) ;;
+  ./*) bin_dir="$PWD/${bin_dir#./}" ;;
+  *) bin_dir="$PWD/$bin_dir" ;;
+esac
+
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 command -v tar >/dev/null 2>&1 || fail "tar is required"
 
-# uname onto the target table's names (ADR-0001): a machine this table does
-# not describe is refused, not guessed at.
+# uname onto the target table's names (scripts/targets.json, ADR-0001): a
+# machine this table does not describe is refused, not guessed at. This is a
+# deliberate re-spelling of the vocabulary — the installer has no repository
+# to read here; a rename in the table must be echoed in this case cascade.
 os="$(uname -s)"
 cpu="$(uname -m)"
 case "$os" in

@@ -70,7 +70,10 @@ names code, issues, tests, workflows and ADRs must use.
 - **target table** — `scripts/targets.json`: the single source of the target
   list, each target's rust target triple, runner label, macOS deployment floor,
   brew membership and executable suffix. The release matrix, every asset name
-  and the packer all read it; nothing spells a target out beside it.
+  and the packer all read it; nothing that *can* read it spells a target out
+  beside it. The **installer** is the one exception that cannot — it runs
+  before this repository exists on the user's machine — so it hand-spells the
+  names and carries a comment pointing back here (ADR-0006).
 - **binary** — `cargo build --release` output for one target. On Linux it is
   statically linked against musl, so a **tarball asset** of it runs on any
   glibc age. A binary is a build intermediate: only `win32-x64`'s is published
@@ -90,11 +93,13 @@ names code, issues, tests, workflows and ADRs must use.
 - **checksum manifest** — `SHA256SUMS`, listing the sha256 of every published
   asset, sorted by file name, as `<hash>  <file>` lines. It names the exact
   bytes a channel installed.
-- **asset name** — derived only by `scripts/asset-name.sh` from the **target
-  table**. This is the cross-repo contract with the **tap**: the tap's
-  `scripts/render.mjs` pins URLs built from the same pattern, and a release
-  that stops publishing one of them fails the **bump** rather than handing a
-  user a 404.
+- **asset name** — spelled in code only by `scripts/asset-name.sh`, from the
+  **target table**. The **installer** builds the same name inline because it
+  runs on a user's machine with no repository to read; that duplication is
+  deliberate and ADR-0006 records it. This is the cross-repo contract with the
+  **tap**: the tap's `scripts/render.mjs` pins URLs built from the same
+  pattern, and a release that stops publishing one of them fails the **bump**
+  rather than handing a user a 404.
 - **republishing** — uploading the same version's assets again. Legal here,
   because a **tarball asset** of unchanged bytes hashes identically; it is not
   legal for an unsigned, un-versioned archive name.
