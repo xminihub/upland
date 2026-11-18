@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 axum = "0.8.9"
+bcrypt = "0.19.3"
 jsonwebtoken = { version = "12.0.0", default-features = false, features = ["rust_crypto"] }
 rand = "0.10.4"
 rust-embed = { version = "8.14.0", features = ["mime-guess"] }

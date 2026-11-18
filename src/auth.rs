@@ -64,7 +64,7 @@ pub struct Claims {
     pub exp: i64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AccessTokenIssuer {
     secret: SigningSecret,
     ttl_seconds: i64,

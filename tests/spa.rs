@@ -6,6 +6,13 @@ async fn test_server() -> TestServer {
         .expect("in-memory test database");
     TestServer::new(upland::router(upland::AppState {
         db: std::sync::Arc::new(db),
+        access_tokens: upland::auth::AccessTokenIssuer::new(
+            upland::auth::SigningSecret::from_hex(
+                "abababababababababababababababababababababababababababababababab",
+            )
+            .expect("test secret"),
+            3600,
+        ),
     }))
 }
 

@@ -3,13 +3,19 @@ use std::sync::Arc;
 
 use axum::Json;
 use axum::Router;
+use axum::extract::{Request, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::http::Uri;
 use axum::http::header::CONTENT_TYPE;
+use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
+use axum::routing::post;
 use rust_embed::RustEmbed;
 use serde_json::{Value, json};
+
+use crate::auth::AccessTokenIssuer;
 
 pub mod auth;
 pub mod db;
@@ -31,11 +37,15 @@ pub fn spa_enabled() -> bool {
 #[derive(Clone)]
 pub struct AppState {
     pub db: Arc<Db>,
+    /// The **access token** mint and its guard (ADR-0004): the **signing
+    /// secret** and TTL arrive once from the **config file**, never from a
+    /// handler.
+    pub access_tokens: AccessTokenIssuer,
 }
 
 pub fn router(state: AppState) -> Router {
     let router = Router::<AppState>::new()
-        .nest("/api", api())
+        .nest("/api", api(state.clone()))
         .route("/healthz", get(healthz))
         .with_state(state);
     if spa_enabled() {
@@ -56,11 +66,225 @@ async fn spa_fallback(uri: Uri) -> Response {
     }
 }
 
-fn api() -> Router<AppState> {
-    let v1 = Router::new()
+fn api(state: AppState) -> Router<AppState> {
+    let public = Router::new().route("/auth/signup", post(signup));
+    let guarded = Router::new()
         .route("/hello", get(hello))
-        .fallback(api_not_found);
-    Router::new().nest("/v1", v1).fallback(api_not_found)
+        .route_layer(from_fn_with_state(state, require_bearer));
+    Router::new()
+        .nest("/v1", public.merge(guarded).fallback(api_not_found))
+        .fallback(api_not_found)
+}
+
+/// The bearer middleware (ADR-0004): a token must verify with the signing
+/// secret and name an account that still exists. Every failure answers the
+/// same `unauthorized` code — the API does not explain which half of a
+/// guess was wrong.
+async fn require_bearer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Response {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
+    let claims = match state.access_tokens.verify(bearer) {
+        Ok(claims) => claims,
+        Err(_) => return unauthorized(),
+    };
+    let Ok(subject) = claims.sub.parse::<i64>() else {
+        return unauthorized();
+    };
+    let alive = sqlx::query!("SELECT id FROM accounts WHERE id = ?", subject)
+        .fetch_optional(state.db.reader())
+        .await;
+    match alive {
+        Ok(Some(_)) => next.run(request).await,
+        _ => unauthorized(),
+    }
+}
+
+fn unauthorized() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({ "error": { "code": "unauthorized" } })),
+    )
+        .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct SignupBody {
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+async fn signup(
+    State(state): State<AppState>,
+    payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> (StatusCode, Json<Value>) {
+    let Ok(Json(body)) = payload else {
+        return invalid(None);
+    };
+    let Ok(parsed) = serde_json::from_value::<SignupBody>(body) else {
+        return invalid(None);
+    };
+    let Some(username) = parsed.username else {
+        return invalid(Some("username"));
+    };
+    let Some(email) = parsed.email else {
+        return invalid(Some("email"));
+    };
+    let Some(password) = parsed.password else {
+        return invalid(Some("password"));
+    };
+
+    // Field rules (spec #13): ASCII minimal and explicit, mirrored by the
+    // SPA forms; the table's NOCASE uniques are the last word.
+    let username = username.trim().to_lowercase();
+    let valid_username = (3..=32).contains(&username.len())
+        && username
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b".-_".contains(&b));
+    if !valid_username {
+        return invalid(Some("username"));
+    }
+
+    let email = email.trim().to_lowercase();
+    let valid_email = match email.split_once('@') {
+        Some((local, domain)) => !local.is_empty() && !domain.is_empty() && !domain.contains('@'),
+        None => false,
+    };
+    if !valid_email {
+        return invalid(Some("email"));
+    }
+
+    // bcrypt silently truncates at 72 bytes; a password that long was
+    // never the one that would be checked at login.
+    let valid_password = !password.is_empty() && password.len() <= 72;
+    if !valid_password {
+        return invalid(Some("password"));
+    }
+
+    if let Some(taken) = taken_handle(&state, &username, &email).await {
+        return conflict(taken);
+    }
+
+    let hashing = tokio::task::spawn_blocking(move || bcrypt::hash(&password, 12));
+    let Ok(Ok(hash)) = hashing.await else {
+        return internal();
+    };
+
+    let created_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after 1970")
+        .as_secs() as i64;
+    let inserted = sqlx::query!(
+        "INSERT INTO accounts (username, email, created_at) VALUES (?, ?, ?) RETURNING id",
+        username,
+        email,
+        created_at
+    )
+    .fetch_one(state.db.writer())
+    .await;
+    let row = match inserted {
+        Ok(row) => row,
+        Err(error) => {
+            // The race the pre-check cannot close: two boots claim one
+            // handle, the database says one.
+            if let Some(taken) = collision_of(&error) {
+                return conflict(taken);
+            }
+            return internal();
+        }
+    };
+    let id = row.id;
+    if sqlx::query!(
+        "INSERT INTO credentials (account_id, password_hash) VALUES (?, ?)",
+        id,
+        hash.to_string()
+    )
+    .execute(state.db.writer())
+    .await
+    .is_err()
+    {
+        // Roll the half-account back: an account nobody can enter is a
+        // taken handle held hostage. The logs table this notice would
+        // write to is still unbuilt (ADR-0003).
+        let _ = sqlx::query!("DELETE FROM accounts WHERE id = ?", id)
+            .execute(state.db.writer())
+            .await;
+        return internal();
+    }
+
+    match state.access_tokens.mint(&id.to_string()) {
+        Ok(token) => (StatusCode::OK, Json(json!({ "access_token": token }))),
+        Err(_) => internal(),
+    }
+}
+
+async fn taken_handle(state: &AppState, username: &str, email: &str) -> Option<&'static str> {
+    if sqlx::query!("SELECT id FROM accounts WHERE username = ?", username)
+        .fetch_optional(state.db.reader())
+        .await
+        .ok()?
+        .is_some()
+    {
+        return Some("username_taken");
+    }
+    if sqlx::query!("SELECT id FROM accounts WHERE email = ?", email)
+        .fetch_optional(state.db.reader())
+        .await
+        .ok()?
+        .is_some()
+    {
+        return Some("email_taken");
+    }
+    None
+}
+
+fn collision_of(error: &sqlx::Error) -> Option<&'static str> {
+    let text = error.to_string();
+    if text.contains("accounts.username") {
+        Some("username_taken")
+    } else if text.contains("accounts.email") {
+        Some("email_taken")
+    } else {
+        None
+    }
+}
+
+fn conflict(code: &str) -> (StatusCode, Json<Value>) {
+    let field = if code == "username_taken" {
+        "username"
+    } else {
+        "email"
+    };
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "error": { "code": code, "field": field } })),
+    )
+}
+
+fn internal() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({ "error": { "code": "internal" } })),
+    )
+}
+
+fn invalid(field: Option<&str>) -> (StatusCode, Json<Value>) {
+    let error = match field {
+        Some(field) => json!({ "error": { "code": "invalid", "field": field } }),
+        None => json!({ "error": { "code": "invalid" } }),
+    };
+    (StatusCode::UNPROCESSABLE_ENTITY, Json(error))
 }
 
 async fn api_not_found() -> (StatusCode, Json<Value>) {
@@ -68,7 +292,10 @@ async fn api_not_found() -> (StatusCode, Json<Value>) {
 }
 
 fn json_not_found() -> (StatusCode, Json<Value>) {
-    (StatusCode::NOT_FOUND, Json(json!({ "error": "not found" })))
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({ "error": { "code": "not_found" } })),
+    )
 }
 
 async fn hello() -> Json<Value> {
@@ -1180,6 +1407,13 @@ mod tests {
                 crate::db::Db::in_memory()
                     .await
                     .expect("in-memory test database"),
+            ),
+            access_tokens: crate::auth::AccessTokenIssuer::new(
+                crate::auth::SigningSecret::from_hex(
+                    "abababababababababababababababababababababababababababababababab",
+                )
+                .expect("test secret"),
+                3600,
             ),
         }
     }

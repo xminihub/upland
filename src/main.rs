@@ -45,7 +45,14 @@ async fn main() -> ExitCode {
 
     println!("upland listening on http://{addr}");
     println!("upland database at {}", db.path().display());
-    axum::serve(listener, upland::router(upland::AppState { db }))
+    let state = upland::AppState {
+        db,
+        access_tokens: upland::auth::AccessTokenIssuer::new(
+            config.signing_secret,
+            config.ttl_seconds,
+        ),
+    };
+    axum::serve(listener, upland::router(state))
         .await
         .expect("server should run");
 

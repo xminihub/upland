@@ -28,11 +28,11 @@ impl Drop for TempDb {
 #[tokio::test]
 async fn the_baseline_migration_is_recorded() {
     let db = upland::db::Db::in_memory().await.expect("db");
-    let (version,): (i64,) = sqlx::query_as("SELECT version FROM _sqlx_migrations")
+    let (version,): (i64,) = sqlx::query_as("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(db.reader())
         .await
         .expect("migration history");
-    assert_eq!(version, 20261118000001);
+    assert_eq!(version, 20261118000002);
     db.close().await;
 }
 
