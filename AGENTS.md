@@ -37,6 +37,12 @@ Issues are tracked as GitHub Issues on `xminihub/upland` via the `gh` CLI. See `
 
 Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
+### Web UI skills
+
+`shadcn` and `migrate-radix-to-base` apply only to the frontend in `web/`. Load them as soon as any subtask touches `web/` UI code — including mixed Rust+UI tasks once the backend part is done. Do not load them for purely backend, API, or packaging work.
+
+All shadcn CLI commands must run with `web/` as the working directory using Bun (`cd web && bunx --bun shadcn@latest ...`); `components.json` lives in `web/`, not the repo root. If the skill's "Current Project Context" was generated from the repo root, re-run `info --json` from `web/` before trusting it.
+
 ### Language
 
 Write all markdown you generate for this repo — specs, issues, task files, `CONTEXT.md`, ADRs, reports — in **English**. Code, commands, file paths, identifiers, and quoted error messages stay verbatim. This applies to new output only; don't translate existing docs.
