@@ -61,8 +61,17 @@ fi
 
 gnu_tar() {
   local candidate
-  for candidate in "${TAR:-}" gtar tar; do
-    [ -n "$candidate" ] || continue
+  # An explicit TAR is the operator's answer, not a first try: when it is set,
+  # only it is checked, so TAR=/some/bsdtar refuses loudly instead of quietly
+  # packing with the system tar the operator did not choose. That fallback is
+  # exactly what no GNU tar on the path should not turn into a green run.
+  if [ -n "${TAR:-}" ]; then
+    command -v "$TAR" >/dev/null 2>&1 || return 1
+    "$TAR" --version 2>/dev/null | grep -q '^tar (GNU tar)' || return 1
+    printf '%s\n' "$TAR"
+    return 0
+  fi
+  for candidate in gtar tar; do
     command -v "$candidate" >/dev/null 2>&1 || continue
     if "$candidate" --version 2>/dev/null | grep -q '^tar (GNU tar)'; then
       printf '%s\n' "$candidate"
@@ -73,7 +82,11 @@ gnu_tar() {
 }
 
 if ! tar_bin="$(gnu_tar)"; then
-  echo "package-brew-tarball: GNU tar is required, and $(tar --version 2>&1 | head -1) is not it." >&2
+  if [ -n "${TAR:-}" ]; then
+    echo "package-brew-tarball: TAR=$TAR is not GNU tar ($("$TAR" --version 2>&1 | head -1))." >&2
+  else
+    echo "package-brew-tarball: GNU tar is required, and $(tar --version 2>&1 | head -1) is not it." >&2
+  fi
   echo "package-brew-tarball: this packs on Linux (the release and CI run it there);" >&2
   echo "package-brew-tarball: to run it on macOS, brew install gnu-tar and set TAR=gtar." >&2
   exit 1
