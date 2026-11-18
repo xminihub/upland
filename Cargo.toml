@@ -2,7 +2,7 @@
 name = "upland"
 version = "0.1.0"
 edition = "2024"
-description = "Upland web application"
+description = "HTTP API server with an embedded web UI"
 license-file = "LICENSE"
 repository = "https://github.com/xminihub/upland"
 
@@ -14,6 +14,7 @@ path = "src/main.rs"
 axum = "0.8.9"
 rust-embed = { version = "8.14.0", features = ["mime-guess"] }
 serde_json = "1.0.154"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite-bundled", "migrate", "macros"] }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net"] }
 
 [dev-dependencies]

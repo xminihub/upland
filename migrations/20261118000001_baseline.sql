@@ -1,0 +1,4 @@
+-- The baseline migration. It exists so the migration chain starts here and
+-- `cargo sqlx prepare` has a schema to generate offline metadata against;
+-- the gateway's tables (credentials, logs, analytics, sessions) land in
+-- their own migrations with the features that need them (ADR-0003).

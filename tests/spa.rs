@@ -1,5 +1,14 @@
 use axum_test::TestServer;
 
+async fn test_server() -> TestServer {
+    let db = upland::db::Db::in_memory()
+        .await
+        .expect("in-memory test database");
+    TestServer::new(upland::router(upland::AppState {
+        db: std::sync::Arc::new(db),
+    }))
+}
+
 fn dist_is_empty() -> bool {
     if upland::spa_enabled() {
         false
@@ -14,7 +23,7 @@ async fn visitor_receives_spa_index_at_root() {
     if dist_is_empty() {
         return;
     }
-    let server = TestServer::new(upland::router());
+    let server = test_server().await;
     let response = server.get("/").await;
 
     response.assert_status_ok();
@@ -34,7 +43,7 @@ async fn visitor_can_deep_link_to_any_spa_route() {
     if dist_is_empty() {
         return;
     }
-    let server = TestServer::new(upland::router());
+    let server = test_server().await;
     let response = server.get("/some/spa/route").await;
 
     response.assert_status_ok();
@@ -56,7 +65,7 @@ async fn bundled_asset_is_served_with_its_bytes() {
     let file_name = asset.file_name().unwrap().to_str().unwrap().to_owned();
     let expected_bytes = std::fs::read(&asset).unwrap();
 
-    let server = TestServer::new(upland::router());
+    let server = test_server().await;
     let url = format!("/assets/{file_name}");
     let response = server.get(url.as_str()).await;
 
