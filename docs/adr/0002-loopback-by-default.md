@@ -39,19 +39,20 @@ bind is not an API-only risk.
   line is nonsense. That string is what `Formula/upland.rb`'s `test do` matches
   against its own pinned version, so the release tag, the formula and the
   binary have one source: the version in `Cargo.toml`.
-- `--help` prints the flags, the defaults and the two environment variables.
+- `--help` prints the flags, the defaults and the environment variables it reads.
 - Bad input is an error, not a fallback: an unknown option, a `--port` that is
   not 1–65535, or a `--port`/`--host` missing its value prints
-  `upland: <what went wrong>`, then the usage, and exits `2`. A blank host is
-  rejected; an unparseable `UPLAND_PORT` is ignored in favour of the default,
-  because that variable is set by whoever launched us and a stale shell export
-  is not a reason to refuse to start.
+  `upland: <what went wrong>`, then the usage, and exits `2`. So does a
+  `UPLAND_HOST` that is blank and a `UPLAND_PORT` that cannot be a port: an
+  environment value nobody can parse must not become a server on the default
+  port, because the operator reading their own launchd plist would see the
+  value they wrote and believe it was the one in use.
 - Parsing lives in `src/lib.rs` (`Config::from_args`, `parse_args`,
   `version_line`, `usage`) with the unit tests in the same file, and
   `src/main.rs` only maps the result to output and exit codes. No socket is
   opened by any test, in keeping with `tests/api.rs` and `tests/spa.rs`.
 - No new dependency. upland's tree is axum, tokio, serde_json, rust-embed;
-  four flags and two environment variables do not justify a clap dependency,
+  three flags and three environment variables do not justify a clap dependency,
   its derive macros and the `clippy -Dwarnings` surface that comes with them.
   `rust-embed` and the router are unchanged.
 

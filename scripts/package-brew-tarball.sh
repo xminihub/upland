@@ -25,71 +25,71 @@ version=""
 target=""
 dir="."
 while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --binary)
-      binary="${2:-}"
-      shift 2
-      ;;
-    --version)
-      version="${2:-}"
-      shift 2
-      ;;
-    --target)
-      target="${2:-}"
-      shift 2
-      ;;
-    --dir)
-      dir="${2:-}"
-      shift 2
-      ;;
-    *)
-      echo "package-brew-tarball: unexpected argument: $1" >&2
-      exit 2
-      ;;
-  esac
+    case "$1" in
+        --binary)
+            binary="${2:-}"
+            shift 2
+            ;;
+        --version)
+            version="${2:-}"
+            shift 2
+            ;;
+        --target)
+            target="${2:-}"
+            shift 2
+            ;;
+        --dir)
+            dir="${2:-}"
+            shift 2
+            ;;
+        *)
+            echo "package-brew-tarball: unexpected argument: $1" >&2
+            exit 2
+            ;;
+    esac
 done
 
 if [ -z "$binary" ] || [ -z "$version" ] || [ -z "$target" ]; then
-  echo "usage: package-brew-tarball.sh --binary <path> --version <semver> --target <brew target> --dir <outdir>" >&2
-  exit 2
+    echo "usage: package-brew-tarball.sh --binary <path> --version <semver> --target <brew target> --dir <outdir>" >&2
+    exit 2
 fi
 
 if [ ! -s "$binary" ]; then
-  echo "package-brew-tarball: missing or empty binary: $binary" >&2
-  exit 1
+    echo "package-brew-tarball: missing or empty binary: $binary" >&2
+    exit 1
 fi
 
 gnu_tar() {
-  local candidate
-  # An explicit TAR is the operator's answer, not a first try: when it is set,
-  # only it is checked, so TAR=/some/bsdtar refuses loudly instead of quietly
-  # packing with the system tar the operator did not choose. That fallback is
-  # exactly what no GNU tar on the path should not turn into a green run.
-  if [ -n "${TAR:-}" ]; then
-    command -v "$TAR" >/dev/null 2>&1 || return 1
-    "$TAR" --version 2>/dev/null | grep -q '^tar (GNU tar)' || return 1
-    printf '%s\n' "$TAR"
-    return 0
-  fi
-  for candidate in gtar tar; do
-    command -v "$candidate" >/dev/null 2>&1 || continue
-    if "$candidate" --version 2>/dev/null | grep -q '^tar (GNU tar)'; then
-      printf '%s\n' "$candidate"
-      return 0
+    local candidate
+    # An explicit TAR is the operator's answer, not a first try: when it is set,
+    # only it is checked, so TAR=/some/bsdtar refuses loudly instead of quietly
+    # packing with the system tar the operator did not choose. That fallback is
+    # exactly what no GNU tar on the path should not turn into a green run.
+    if [ -n "${TAR:-}" ]; then
+        command -v "$TAR" >/dev/null 2>&1 || return 1
+        "$TAR" --version 2>/dev/null | grep -q '^tar (GNU tar)' || return 1
+        printf '%s\n' "$TAR"
+        return 0
     fi
-  done
-  return 1
+    for candidate in gtar tar; do
+        command -v "$candidate" >/dev/null 2>&1 || continue
+        if "$candidate" --version 2>/dev/null | grep -q '^tar (GNU tar)'; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
 }
 
 if ! tar_bin="$(gnu_tar)"; then
-  if [ -n "${TAR:-}" ]; then
-    echo "package-brew-tarball: TAR=$TAR is not GNU tar ($("$TAR" --version 2>&1 | head -1))." >&2
-  else
-    echo "package-brew-tarball: GNU tar is required, and $(tar --version 2>&1 | head -1) is not it." >&2
-  fi
-  echo "package-brew-tarball: this packs on Linux (the release and CI run it there);" >&2
-  echo "package-brew-tarball: to run it on macOS, brew install gnu-tar and set TAR=gtar." >&2
-  exit 1
+    if [ -n "${TAR:-}" ]; then
+        echo "package-brew-tarball: TAR=$TAR is not GNU tar ($("$TAR" --version 2>&1 | head -1))." >&2
+    else
+        echo "package-brew-tarball: GNU tar is required, and $(tar --version 2>&1 | head -1) is not it." >&2
+    fi
+    echo "package-brew-tarball: this packs on Linux (the release and CI run it there);" >&2
+    echo "package-brew-tarball: to run it on macOS, brew install gnu-tar and set TAR=gtar." >&2
+    exit 1
 fi
 
 asset="$("$script_dir/asset-name.sh" --version "$version" --target "$target" --kind tarball)"
@@ -104,21 +104,21 @@ cp "$binary" "$stage/$member"
 chmod 0755 "$stage/$member"
 
 (
-  cd "$stage"
-  "$tar_bin" -cf - \
-    --format=ustar \
-    --owner=0 --group=0 --numeric-owner \
-    --mode=0755 \
-    --mtime=@0 \
-    --sort=name \
-    "$member" | gzip -n -9
+    cd "$stage"
+    "$tar_bin" -cf - \
+        --format=ustar \
+        --owner=0 --group=0 --numeric-owner \
+        --mode=0755 \
+        --mtime=@0 \
+        --sort=name \
+        "$member" | gzip -n -9
 ) >"$out"
 
 if command -v sha256sum >/dev/null 2>&1; then
-  sha256="$(sha256sum "$out" | cut -d' ' -f1)"
+    sha256="$(sha256sum "$out" | cut -d' ' -f1)"
 else
-  sha256="$(shasum -a 256 "$out" | cut -d' ' -f1)"
+    sha256="$(shasum -a 256 "$out" | cut -d' ' -f1)"
 fi
 
 jq -cn --arg asset "$asset" --arg path "$out" --arg sha256 "$sha256" \
-  '{asset: $asset, path: $path, sha256: $sha256}'
+    '{asset: $asset, path: $path, sha256: $sha256}'

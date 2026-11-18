@@ -195,13 +195,19 @@ where
     if host.trim().is_empty() {
         return Err("not a host: the bind address must not be empty".to_owned());
     }
-    let port = port.or_else(|| {
-        env("UPLAND_PORT")
-            .and_then(|value| value.parse::<u16>().ok())
-            .filter(|port| *port > 0)
-    });
-    // Unlike an unusable port, an empty UPLAND_DB_PATH is a failure rather
-    // than a nudge back to the default: a unit file that lost its path
+    // A value that cannot be a port is a failure rather than a nudge back to
+    // the default, whether it arrived as a flag or in the environment: an
+    // operator reading their own launchd plist would otherwise see the port
+    // they wrote and believe it was the one in use.
+    let port = match port {
+        Some(port) => port,
+        None => match env("UPLAND_PORT") {
+            Some(value) => parse_port(&value)?,
+            None => DEFAULT_PORT,
+        },
+    };
+    // An empty UPLAND_DB_PATH is a failure rather than a nudge back to the
+    // default: a unit file that lost its path
     // mid-edit would otherwise open a database nobody pointed it at, in a
     // directory nobody chose.
     let db_path = match db_path.or_else(|| env("UPLAND_DB_PATH")) {
@@ -212,10 +218,22 @@ where
         None => default_db_path(env)?,
     };
 
-    Ok((host, port.unwrap_or(DEFAULT_PORT), db_path))
+    Ok((host, port, db_path))
 }
 
 impl Config {
+    /// The **listen address** (CONTEXT.md) as one string: the one place
+    /// `host:port` is composed. An IPv6 host is bracketed, because `::1:8080`
+    /// is a valid IPv6 literal that means something other than port 8080.
+    pub fn listen_address(&self) -> String {
+        let host = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        format!("{host}:{}", self.port)
+    }
+
     pub fn from_args<I, S, E>(args: I, env: E) -> Result<Self, String>
     where
         I: IntoIterator<Item = S>,
@@ -368,18 +386,18 @@ mod tests {
     fn environment_variables_apply_when_the_flags_are_absent() {
         let config = crate::Config::from_args(
             Vec::<String>::new(),
-            env(&[("UPLAND_HOST", "0.0.0.0"), ("UPLAND_PORT", "8310")]),
+            env(&[("UPLAND_HOST", "0.0.0.0"), ("UPLAND_PORT", "9100")]),
         )
         .expect("env");
         assert_eq!(config.host, "0.0.0.0");
-        assert_eq!(config.port, 8310);
+        assert_eq!(config.port, 9100);
     }
 
     #[test]
     fn a_flag_wins_over_the_environment_variable_it_disagrees_with() {
         let config = crate::Config::from_args(
             vec!["--port".to_string(), "7000".to_string()],
-            env(&[("UPLAND_HOST", "0.0.0.0"), ("UPLAND_PORT", "8310")]),
+            env(&[("UPLAND_HOST", "0.0.0.0"), ("UPLAND_PORT", "9100")]),
         )
         .expect("flag beats env");
         assert_eq!(config.port, 7000);
@@ -397,14 +415,39 @@ mod tests {
     }
 
     #[test]
-    fn an_environment_port_that_is_not_a_number_is_ignored() {
-        // UPLAND_PORT is set by whoever launched us (a leftover shell export, a
-        // plist); a value that cannot be a port is not a reason to refuse to
-        // start with the default one.
-        let config =
-            crate::Config::from_args(Vec::<String>::new(), env(&[("UPLAND_PORT", "http")]))
-                .expect("default port");
-        assert_eq!(config.port, 8080);
+    fn an_environment_port_that_is_not_a_number_is_a_failure_too() {
+        // UPLAND_PORT is set by whoever launched us — a shell export, a
+        // launchd plist. A value that cannot be a port must not quietly become
+        // a server on the default port: the operator would read their own
+        // plist, see the value they wrote, and believe it was in use.
+        for value in ["http", "0", "65536", ""] {
+            let error =
+                crate::Config::from_args(Vec::<String>::new(), env(&[("UPLAND_PORT", value)]))
+                    .expect_err("must fail");
+            assert!(error.contains("port"), "{value} produced {error}");
+        }
+    }
+
+    #[test]
+    fn an_ipv6_listen_address_is_bracketed() {
+        // "::1:8080" is itself a legal IPv6 literal meaning something else, so
+        // an unbracketed IPv6 host would bind an address nobody wrote down.
+        let config = crate::Config::from_args(
+            vec![
+                "--host".to_string(),
+                "::1".to_string(),
+                "--port".to_string(),
+                "9100".to_string(),
+            ],
+            env(&[]),
+        )
+        .expect("ipv6 loopback");
+        assert_eq!(config.listen_address(), "[::1]:9100");
+
+        let ipv4 =
+            crate::Config::from_args(Vec::<String>::new(), env(&[("UPLAND_HOST", "0.0.0.0")]))
+                .expect("ipv4");
+        assert_eq!(ipv4.listen_address(), "0.0.0.0:8080");
     }
 
     #[test]
@@ -473,10 +516,10 @@ mod tests {
 
     #[test]
     fn serving_is_the_default_invocation() {
-        let serve = crate::parse_args(vec!["--port".to_string(), "8310".to_string()], env(&[]))
+        let serve = crate::parse_args(vec!["--port".to_string(), "9100".to_string()], env(&[]))
             .expect("serve");
         match serve {
-            crate::Invocation::Serve(config) => assert_eq!(config.port, 8310),
+            crate::Invocation::Serve(config) => assert_eq!(config.port, 9100),
             _ => panic!("expected a server"),
         }
     }

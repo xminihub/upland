@@ -13,7 +13,9 @@ names code, issues, tests, workflows and ADRs must use.
 - **listen address** — the `host:port` the binary binds, from `--host`/`--port`
   or `UPLAND_HOST`/`UPLAND_PORT`, defaulting to `127.0.0.1:8080`
   (ADR-0002). `localhost` is not the term: the flag takes an address, and
-  `0.0.0.0` is a legal one.
+  `0.0.0.0` is a legal one. An IPv6 host is bracketed when the address is
+  composed, because `::1:8080` is itself a legal IPv6 literal that means
+  something else.
 - **SPA bundle** — the Vite build in `web/dist`, embedded into the binary by
   `rust-embed` at release compile time. A target's binary and its bundle are
   one artifact; there is no separate frontend deployment.
@@ -84,8 +86,9 @@ names code, issues, tests, workflows and ADRs must use.
   green release means an installable formula.
 - **brew service** — the launchd/systemd job `templates/upland.rb.tpl` declares:
   `brew services start upland` runs the **server** on loopback port 8310. That
-  port belongs to the tap; this repository's source never mentions it, and the
-  **listen address** flags are what make it possible for the tap to choose one.
+  port belongs to the tap: no code, script or workflow here mentions it, and
+  README quotes it only as the tap's choice. The **listen address** flags are
+  what make it possible for the tap to choose one.
 
 ## Packaging vocabulary
 

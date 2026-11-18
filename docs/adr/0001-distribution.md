@@ -112,7 +112,14 @@ verifies a checksum, never that a binary starts on the user's libc.
   target.
 - `package` (Ubuntu, GNU tar) renames, packs and checksums; `github-release`
   uploads exactly what `package` produced; `tap` then dispatches the bump and
-  polls it. A failed bump fails the release.
+  polls it. A failed bump fails the release. The job's verdict is not the run's
+  conclusion but the tap's own file: it reads back `Formula/upland.rb` and fails
+  unless that formula pins the version just released. A bump run is only
+  identifiable as ours from its job name ("Bump upland to <version>"), because
+  the run itself is titled after the workflow, so another tool's bump in the
+  same window would otherwise be watched and reported as ours. A failed run that
+  left the right version pinned anyway — a repair re-dispatch, for instance — is
+  a warning, not a red release, because the channel is what the gate is about.
 - The credentials are split by direction: the tap commits with its own token,
   and this repository dispatches with `TAP_TRIGGER_TOKEN`, an Actions-only
   fine-grained PAT. `HOMEBREW_TAP_TOKEN` — a content-write PAT for another
@@ -163,14 +170,23 @@ verifies a checksum, never that a binary starts on the user's libc.
 
 ## Consequences
 
-- What is proven and what is not, at the time of writing: the CLI surface, the
-  name derivation, the packer's refusals and the tap's rendering of upland's
-  four targets are verified locally (`cargo test`, the packaging assertions'
-  logic against fixture archives, `node scripts/render.mjs` plus `brew style`
-  on a rendered formula with no offenses). `brew fetch --all-platforms`,
-  `brew audit --strict --online`, `brew install` and `brew test upland` cannot
-  pass until assets exist — they are the first release's proof, not this
-  document's.
+- What is proven and what is not, at the time of writing. Proven here: the CLI
+  surface (`cargo test`), the name derivation for every row of the table and the
+  packer's refusals (`scripts/test-package-brew-tarball.sh`, 28 checks), the
+  packer's output against a real release binary — one member named `upland`,
+  mode `0755`, mtime 1970, byte-identical across two runs, and the extracted
+  binary running and printing its version — the `package` job's shell simulated
+  end to end, the `tap` job's run selection and formula gate against the tap's
+  real `lim` bump run, and the cross-repo contract: the tap's
+  `scripts/render.mjs assets upland 0.1.1` and this repository's
+  `scripts/asset-name.sh` print the same four names, and `brew style` finds no
+  offense in the rendered `Formula/upland.rb`. Not proven here: that GNU tar
+  itself accepts the flags the packer passes (the local run used an emulator that
+  writes those header fields faithfully and refuses nothing — real tar's verdict
+  is ci.yml's `packaging` job), that a musl link succeeds on the runners, and
+  that `brew fetch --all-platforms`, `brew audit --strict --online`,
+  `brew install` and `brew test upland` pass, which need published assets and so
+  belong to the first release.
 - Nothing breaks for existing users, because there are none: no tag, no release
   and no download of `upland-<os>-<arch>.tar.gz` ever existed. `README.md`
   documented a naming scheme that was never published, which is why changing it

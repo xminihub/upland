@@ -20,7 +20,7 @@ async fn main() -> ExitCode {
         }
     };
 
-    let addr = format!("{}:{}", config.host, config.port);
+    let addr = config.listen_address();
 
     // Open the database before binding: a machine that cannot write its data
     // directory should fail without having taken a port first.

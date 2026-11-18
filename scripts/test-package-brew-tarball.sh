@@ -18,58 +18,58 @@ failures=0
 checks=0
 
 ok() {
-  checks=$((checks + 1))
-  printf 'ok   %s\n' "$*"
+    checks=$((checks + 1))
+    printf 'ok   %s\n' "$*"
 }
 
 fail() {
-  failures=$((failures + 1))
-  printf 'FAIL %s\n' "$*" >&2
+    failures=$((failures + 1))
+    printf 'FAIL %s\n' "$*" >&2
 }
 
 check() {
-  if [ "$1" = "$2" ]; then
-    ok "$3"
-  else
-    fail "$3: expected [$2], got [$1]"
-  fi
+    if [ "$1" = "$2" ]; then
+        ok "$3"
+    else
+        fail "$3: expected [$2], got [$1]"
+    fi
 }
 
 refuses() {
-  if "$@" >/dev/null 2>&1; then
-    fail "expected a refusal from: $*"
-  else
-    ok "refused: $*"
-  fi
+    if "$@" >/dev/null 2>&1; then
+        fail "expected a refusal from: $*"
+    else
+        ok "refused: $*"
+    fi
 }
 
 for tool in jq python3; do
-  command -v "$tool" >/dev/null 2>&1 || {
-    echo "$tool is required" >&2
-    exit 1
-  }
+    command -v "$tool" >/dev/null 2>&1 || {
+        echo "$tool is required" >&2
+        exit 1
+    }
 done
 
 tar_probe() {
-  local candidate="$1"
-  command -v "$candidate" >/dev/null 2>&1 || return 1
-  "$candidate" --version 2>/dev/null | grep -q '^tar (GNU tar)'
+    local candidate="$1"
+    command -v "$candidate" >/dev/null 2>&1 || return 1
+    "$candidate" --version 2>/dev/null | grep -q '^tar (GNU tar)'
 }
 
 if tar_probe "${TAR:-}" || tar_probe tar; then
-  :
+    :
 else
-  echo "GNU tar is required: this asserts the archive GNU tar writes." >&2
-  echo "On macOS: brew install gnu-tar, then TAR=gtar bash $0" >&2
-  exit 1
+    echo "GNU tar is required: this asserts the archive GNU tar writes." >&2
+    echo "On macOS: brew install gnu-tar, then TAR=gtar bash $0" >&2
+    exit 1
 fi
 
 sha256_of() {
-  if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum "$1" | cut -d' ' -f1
-  else
-    shasum -a 256 "$1" | cut -d' ' -f1
-  fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    else
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
 }
 
 bin_name="$(jq -r '.bin' "$table")"
@@ -81,42 +81,42 @@ trap 'rm -rf "$work"' EXIT
 
 echo "== asset names come from the table =="
 while IFS=$'\t' read -r target brew exe; do
-  expected="$bin_name-$probe_version-$target"
-  [ "$exe" = "true" ] && expected="$expected.exe"
-  check "$("$script_dir/asset-name.sh" --version "$probe_version" --target "$target" --kind binary)" \
-    "$expected" "binary asset name for $target"
+    expected="$bin_name-$probe_version-$target"
+    [ "$exe" = "true" ] && expected="$expected.exe"
+    check "$("$script_dir/asset-name.sh" --version "$probe_version" --target "$target" --kind binary)" \
+        "$expected" "binary asset name for $target"
 
-  if [ "$brew" = "true" ]; then
-    check "$("$script_dir/asset-name.sh" --version "$probe_version" --target "$target" --kind tarball)" \
-      "$expected.tar.gz" "tarball asset name for $target"
-  else
-    refuses "$script_dir/asset-name.sh" --version "$probe_version" --target "$target" --kind tarball
-  fi
+    if [ "$brew" = "true" ]; then
+        check "$("$script_dir/asset-name.sh" --version "$probe_version" --target "$target" --kind tarball)" \
+            "$expected.tar.gz" "tarball asset name for $target"
+    else
+        refuses "$script_dir/asset-name.sh" --version "$probe_version" --target "$target" --kind tarball
+    fi
 done < <(jq -r '.targets[] | [.name, (.brew | tostring), (.exe | tostring)] | @tsv' "$table")
 
 check "$(jq -r '.targets | length' "$table")" "5" "five targets in the table"
 check "$(jq -r '[.targets[] | select(.brew)] | length' "$table")" "4" "four of them are brew targets"
 
 for bad_version in "v1.2.3" "1.2" "latest"; do
-  refuses "$script_dir/asset-name.sh" --version "$bad_version" --target linux-x64 --kind tarball
+    refuses "$script_dir/asset-name.sh" --version "$bad_version" --target linux-x64 --kind tarball
 done
 refuses "$script_dir/asset-name.sh" --version "$probe_version" --target linux-x64-musl --kind tarball
 
 echo "== the packer refuses a tar that is not GNU tar =="
 printf '#!/bin/sh\nif [ "$1" = "--version" ]; then echo "bsdtar 3.5.3 - libarchive 3.7.4"; exit 0; fi\nexit 1\n' \
-  >"$work/not-gnu-tar"
+    >"$work/not-gnu-tar"
 chmod +x "$work/not-gnu-tar"
 stub="$work/$bin_name-$probe_version-linux-x64"
 printf 'upland stub payload for the packaging assertions\n' >"$stub"
 chmod 0755 "$stub"
 refuses env TAR="$work/not-gnu-tar" "$script_dir/package-brew-tarball.sh" \
-  --binary "$stub" --version "$probe_version" --target linux-x64 --dir "$work"
+    --binary "$stub" --version "$probe_version" --target linux-x64 --dir "$work"
 
 echo "== packing the stub twice =="
 packed_a="$("$script_dir/package-brew-tarball.sh" --binary "$stub" --version "$probe_version" \
-  --target linux-x64 --dir "$work/a")"
+    --target linux-x64 --dir "$work/a")"
 packed_b="$("$script_dir/package-brew-tarball.sh" --binary "$stub" --version "$probe_version" \
-  --target linux-x64 --dir "$work/b")"
+    --target linux-x64 --dir "$work/b")"
 
 asset="$(jq -r '.asset' <<<"$packed_a")"
 path_a="$(jq -r '.path' <<<"$packed_a")"
@@ -124,13 +124,13 @@ path_b="$(jq -r '.path' <<<"$packed_b")"
 check "$asset" "$bin_name-$probe_version-linux-x64.tar.gz" "the reported asset name"
 check "$(basename "$path_a")" "$asset" "the written file is named after the asset"
 check "$(sha256_of "$path_a")" "$(jq -r '.sha256' <<<"$packed_a")" \
-  "the reported sha256 is sha256sum of the file"
+    "the reported sha256 is sha256sum of the file"
 check "$(jq -r '.sha256' <<<"$packed_a")" "$(jq -r '.sha256' <<<"$packed_b")" \
-  "two runs report the same sha256"
+    "two runs report the same sha256"
 if cmp -s "$path_a" "$path_b"; then
-  ok "packing the same bytes twice produces the same archive"
+    ok "packing the same bytes twice produces the same archive"
 else
-  fail "two runs produced different archives: republishing a version would move its sha256"
+    fail "two runs produced different archives: republishing a version would move its sha256"
 fi
 
 echo "== the archive holds one pinned member =="
@@ -174,18 +174,18 @@ print("\n".join(problems))
 PY
 )"
 if [ -z "$header_problems" ]; then
-  ok "one member named $bin_name: mode 0755, uid/gid 0, mtime at the epoch, payload unchanged"
+    ok "one member named $bin_name: mode 0755, uid/gid 0, mtime at the epoch, payload unchanged"
 else
-  while IFS= read -r problem; do
-    [ -n "$problem" ] && fail "$problem"
-  done <<<"$header_problems"
+    while IFS= read -r problem; do
+        [ -n "$problem" ] && fail "$problem"
+    done <<<"$header_problems"
 fi
 
 echo "== the packer refuses what it should =="
 refuses "$script_dir/package-brew-tarball.sh" --binary "$stub" --version "$probe_version" \
-  --target "$win32_target" --dir "$work/reject"
+    --target "$win32_target" --dir "$work/reject"
 refuses "$script_dir/package-brew-tarball.sh" --binary "$work/empty" --version "$probe_version" \
-  --target linux-x64 --dir "$work/reject"
+    --target linux-x64 --dir "$work/reject"
 refuses "$script_dir/package-brew-tarball.sh" --binary "$stub" --target linux-x64 --dir "$work/reject"
 refuses "$script_dir/package-brew-tarball.sh" --binary "$stub" --version "$probe_version" --dir "$work/reject"
 refuses "$script_dir/package-brew-tarball.sh" --binary "$stub" --version v1.2.3 --target linux-x64 --dir "$work/reject"

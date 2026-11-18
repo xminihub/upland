@@ -210,16 +210,33 @@ jobs:
           path: dist/binaries
           merge-multiple: false
 
+      # The packer prints the asset name, path and sha256 it wrote. Those
+      # records, not a second reading of the directory, are what the checksums
+      # file and the guard below use: one derivation per fact (ADR-0001).
       - name: Pack one tarball per brew target
         run: |
           set -euo pipefail
           version="${{ needs.release.outputs.version }}"
+          : > dist/manifest.jsonl
           for target in $(jq -r '.targets[] | select(.brew) | .name' scripts/targets.json); do
             bash scripts/package-brew-tarball.sh \
               --binary "dist/binaries/binary-$target/upland" \
               --version "$version" \
               --target "$target" \
-              --dir dist/assets
+              --dir dist/assets | tee -a dist/manifest.jsonl
+          done
+
+      - name: Name the Windows executable
+        run: |
+          set -euo pipefail
+          version="${{ needs.release.outputs.version }}"
+          for target in $(jq -r '.targets[] | select(.exe) | .name' scripts/targets.json); do
+            asset="$(bash scripts/asset-name.sh --version "$version" --target "$target" --kind binary)"
+            cp "dist/binaries/binary-$target/upland.exe" "dist/assets/$asset"
+            jq -cn --arg asset "$asset" \
+              --arg path "$PWD/dist/assets/$asset" \
+              --arg sha256 "$(sha256sum "dist/assets/$asset" | cut -d' ' -f1)" \
+              '{asset: $asset, path: $path, sha256: $sha256}' >> dist/manifest.jsonl
           done
 
       - name: Write SHA256SUMS
@@ -227,31 +244,27 @@ jobs:
         # alike: the file names the exact bytes a channel installed.
         run: |
           set -euo pipefail
-          version="${{ needs.release.outputs.version }}"
-          for target in $(jq -r '.targets[] | select(.exe) | .name' scripts/targets.json); do
-            asset="$(bash scripts/asset-name.sh --version "$version" --target "$target" --kind binary)"
-            cp "dist/binaries/binary-$target/upland.exe" "dist/assets/$asset"
-          done
-          (
-            cd dist/assets
-            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' |
-              LC_ALL=C sort |
-              xargs sha256sum
-          ) > dist/assets/SHA256SUMS
+          jq -sr 'sort_by(.asset)[] | "\(.sha256)  \(.asset)"' dist/manifest.jsonl > dist/assets/SHA256SUMS
           cat dist/assets/SHA256SUMS
 
-      - name: Every expected asset exists and is not empty
+      - name: Every target in the table has an asset, and the hashes hold
         run: |
           set -euo pipefail
-          version="${{ needs.release.outputs.version }}"
-          for target in $(jq -r '.targets[].name' scripts/targets.json); do
-            if [ "$(jq -r --arg t "$target" '.targets[] | select(.name == $t) | .brew' scripts/targets.json)" = "true" ]; then
-              asset="$(bash scripts/asset-name.sh --version "$version" --target "$target" --kind tarball)"
-            else
-              asset="$(bash scripts/asset-name.sh --version "$version" --target "$target" --kind binary)"
-            fi
-            [ -s "dist/assets/$asset" ] || { echo "missing or empty: $asset"; exit 1; }
-          done
+          expected="$(jq -r '.targets | length' scripts/targets.json)"
+          actual="$(jq -sr 'length' dist/manifest.jsonl)"
+          [ "$expected" = "$actual" ] || {
+            echo "the manifest holds $actual assets, the target table has $expected targets"
+            exit 1
+          }
+          while IFS=$'\t' read -r asset path sha256; do
+            [ -s "$path" ] || { echo "missing or empty: $asset"; exit 1; }
+            actual="$(sha256sum "$path" | cut -d' ' -f1)"
+            [ "$actual" = "$sha256" ] || {
+              echo "sha256 moved for $asset: $actual != $sha256"
+              exit 1
+            }
+            echo "ok $asset"
+          done < <(jq -sr '.[] | [.asset, .path, .sha256] | @tsv' dist/manifest.jsonl)
           ls -la dist/assets
 
       - uses: actions/upload-artifact@v4
@@ -288,44 +301,72 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.TAP_TRIGGER_TOKEN }}
       TAP_REPO: xminihub/homebrew-tap
+      TOOL: upland
       VERSION: ${{ needs.release.outputs.version }}
     steps:
       # The tap owns Formula/upland.rb: this dispatches its bump workflow and
-      # waits for that run to land, so a release whose formula is missing is a
-      # red release rather than a discovery for a user (ADR-0001). The token is
-      # Actions-only on the tap: this job has no content-write credential.
+      # waits for the run that bumps *this tool to this version*, then checks the
+      # formula itself. A release whose formula is not pinned is a red release
+      # rather than a discovery for a user (ADR-0001). The token is Actions-only
+      # on the tap: this job never holds content write access to it.
       - name: Dispatch the formula bump
         id: dispatch
         run: |
           set -euo pipefail
           started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           gh workflow run bump.yml --repo "$TAP_REPO" --ref main \
-            -f name=upland -f version="$VERSION"
+            -f name="$TOOL" -f version="$VERSION"
 
+          # A dispatch is only recognisable as ours from its job name, "Bump
+          # <tool> to <version>": the run itself is titled after the workflow, so
+          # another tool's bump started in the same window would otherwise be
+          # watched and reported as ours.
           run_id=""
           for _ in $(seq 1 60); do
-            run_id="$(gh run list --repo "$TAP_REPO" --workflow bump.yml \
-              --event workflow_dispatch --limit 5 \
-              --json databaseId,createdAt \
-              --jq "[.[] | select(.createdAt >= \"$started_at\")] | .[0].databaseId // empty")"
+            for candidate in $(gh run list --repo "$TAP_REPO" --workflow bump.yml \
+                --event workflow_dispatch --limit 10 \
+                --json databaseId,createdAt \
+                --jq "[.[] | select(.createdAt >= \"$started_at\")] | .[].databaseId"); do
+              if gh api "repos/$TAP_REPO/actions/runs/$candidate/jobs" \
+                  --jq '.jobs[].name' | grep -Fxq "Bump $TOOL to $VERSION"; then
+                run_id="$candidate"
+                break
+              fi
+            done
             [ -n "$run_id" ] && break
             sleep 5
           done
 
           if [ -z "$run_id" ]; then
-            echo "::error::bump.yml never started for upland $VERSION"
+            echo "::error::no bump.yml run for $TOOL $VERSION started after $started_at"
             exit 1
           fi
           echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
           echo "bump run: https://github.com/$TAP_REPO/actions/runs/$run_id"
 
-      - name: Wait for the bump to land
+      - name: Confirm the formula pins this version
         run: |
           set -euo pipefail
-          if ! gh run watch "${{ steps.dispatch.outputs.run_id }}" \
+          if gh run watch "${{ steps.dispatch.outputs.run_id }}" \
               --repo "$TAP_REPO" --exit-status --interval 20; then
-            echo "::error::Formula/upland.rb was not bumped for $VERSION"
+            concluded=success
+          else
+            concluded=failed
+          fi
+
+          # The run's conclusion is not the contract; a version pinned in
+          # Formula/upland.rb is. Reading the formula is what makes "a green
+          # release means an installable formula" true even if the watched run
+          # turned out not to be ours, or a repair re-dispatch already landed the
+          # same version.
+          pinned="$(gh api "repos/$TAP_REPO/contents/Formula/$TOOL.rb" --jq .content \
+            | base64 --decode | sed -n 's#.*/releases/download/v\([^/]*\)/.*#\1#p' | head -1)"
+
+          if [ "$pinned" = "$VERSION" ]; then
+            echo "Formula/$TOOL.rb pins $VERSION (bump run $concluded)"
+            [ "$concluded" = success ] ||
+              echo "::warning::the bump run $concluded, but the formula already pins $VERSION"
+          else
+            echo "::error::Formula/$TOOL.rb pins ${pinned:-nothing}, not $VERSION (bump run $concluded: https://github.com/$TAP_REPO/actions/runs/${{ steps.dispatch.outputs.run_id }})"
             exit 1
           fi
-          gh run view "${{ steps.dispatch.outputs.run_id }}" --repo "$TAP_REPO" \
-            --json conclusion --jq '"tap bump conclusion: \(.conclusion)"'
