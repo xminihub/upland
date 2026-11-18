@@ -1933,7 +1933,7 @@ checksum = "993ad287eb20e8ba755312801cfe1413e0f25d604075863acaddca10b04c1833"
 
 [[package]]
 name = "upland"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "axum-test",
