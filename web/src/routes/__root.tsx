@@ -1,8 +1,28 @@
-import { Link, Outlet, createRootRoute } from "@tanstack/react-router";
+import { useEffect } from "react";
+import {
+  Link,
+  Outlet,
+  createRootRoute,
+  useNavigate,
+} from "@tanstack/react-router";
+
+import { UNAUTHORIZED_EVENT } from "@/lib/api";
 
 export const Route = createRootRoute({ component: RootLayout });
 
 function RootLayout() {
+  const navigate = useNavigate();
+
+  // A 401 anywhere is the session ending (ADR-0004): the API layer has
+  // already forgotten the token, this decides the screen does too.
+  useEffect(() => {
+    const forget = () => {
+      void navigate({ to: "/login" });
+    };
+    window.addEventListener(UNAUTHORIZED_EVENT, forget);
+    return () => window.removeEventListener(UNAUTHORIZED_EVENT, forget);
+  }, [navigate]);
+
   return (
     <div className="flex min-h-dvh flex-col">
       <header className="border-b">
