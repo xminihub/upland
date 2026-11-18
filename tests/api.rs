@@ -15,15 +15,26 @@ async fn test_server() -> TestServer {
 }
 
 #[tokio::test]
-async fn api_consumer_receives_hello_at_api_prefix() {
+async fn api_consumer_receives_hello_at_the_versioned_prefix() {
     let server = test_server().await;
-    let response = server.get("/api/hello").await;
+    let response = server.get("/api/v1/hello").await;
 
     response.assert_status_ok();
     assert_eq!(
         response.json::<Value>(),
         json!({ "message": "Hello from upland!" })
     );
+}
+
+#[tokio::test]
+async fn the_unversioned_hello_path_is_gone_not_aliased() {
+    // A clean break means the old path answers like any unknown API path;
+    // an alias would let the version prefix quietly mean nothing.
+    let server = test_server().await;
+    let response = server.get("/api/hello").await;
+
+    response.assert_status(StatusCode::NOT_FOUND);
+    assert_eq!(response.json::<Value>(), json!({ "error": "not found" }));
 }
 
 #[tokio::test]

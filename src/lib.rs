@@ -55,9 +55,10 @@ async fn spa_fallback(uri: Uri) -> Response {
 }
 
 fn api() -> Router<AppState> {
-    Router::new()
+    let v1 = Router::new()
         .route("/hello", get(hello))
-        .fallback(api_not_found)
+        .fallback(api_not_found);
+    Router::new().nest("/v1", v1).fallback(api_not_found)
 }
 
 async fn api_not_found() -> (StatusCode, Json<Value>) {

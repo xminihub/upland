@@ -39,7 +39,7 @@ cargo sqlx prepare                                               # after changes
 
 ## Endpoints
 
-- `GET /api/hello` — hello message
+- `GET /api/v1/hello` — hello message
 - `GET /healthz` — health check
 - `GET /` — single-page app (served from `web/dist`, embedded into the binary in release builds; when `web/dist` is empty the SPA routes are not mounted and the API works alone)
 
