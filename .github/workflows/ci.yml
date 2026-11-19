@@ -86,6 +86,16 @@ jobs:
       - name: Assert the crate packaging
         run: bash scripts/assert-crate-packaging.sh
 
+      # The listing above is what the packager would carry; this is whether it
+      # accepts the tree at all. cargo's clean-tree check counts every packaged
+      # file git has not committed, so the staged bundle has to be committed
+      # for the publish to see a clean tree — the same thing the release job
+      # does, which is why this is that job's script, run as a dry run: no
+      # upload, no token, no registry version burned. Without it the failure
+      # only ever surfaced on release day, after the tag and the assets.
+      - name: Assert the crate publishes
+        run: bash scripts/publish-crate.sh --dry-run
+
   gate:
     name: Gate
     runs-on: ubuntu-latest
