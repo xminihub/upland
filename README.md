@@ -117,13 +117,13 @@ For full-stack development run `cargo run` and `bun run dev` side by side and op
 
 SPA-serving Rust tests skip when `web/dist` has not been built; run `bun run build` first to exercise them locally.
 
-CI (`.github/workflows/ci.yml`) runs the Rust lint job, a frontend job (frozen install, lint, format check, test, build), the test job — which consumes the frontend build output so SPA serving is tested for real — and the packaging job, which asserts the Homebrew tarball contract.
+CI (`.github/workflows/ci.yml`) runs two lanes in parallel — Web (frozen install, lint, format check, test, build) and Rust (fmt, clippy, test) — then a Packaging job merges them, asserting the Homebrew tarball and gate-summary contracts and that the crate listing carries the Web lane's SPA bundle, and a single Gate job reports every lane's outcome and is the run's one green check. The Rust lane stages no bundle, so its SPA-serving tests skip in CI by decision.
 
 ## Releases
 
 Releases are cut manually: dispatch the `Release` workflow from the Actions tab with a `patch`, `minor`, or `major` bump.
 
-1. `verify` runs every gate — Rust format, lints, tests, the frontend's lint, format check, tests and build, and a crate-packaging gate (the packager's file listing must carry `web/dist/index.html`, `migrations/` and `.sqlx/`) — and uploads `web/dist`, which every target build then embeds. Nothing is tagged until it passes.
+1. `verify` runs every gate — Rust format, lints, tests, the frontend's lint, format check, tests and build, and a crate-packaging gate (the packer's file listing must carry `web/dist/index.html`, `migrations/` and `.sqlx/`) — and uploads `web/dist`, which every target build then embeds. Nothing is tagged until it passes.
 2. `release` bumps the version with cargo-edit and pushes the commit and the `v<version>` tag.
 3. `build` compiles one job per target in [`scripts/targets.json`](scripts/targets.json) — `darwin-arm64`, `darwin-x64`, `linux-x64` (Ubuntu), `linux-arm64` (native `ubuntu-24.04-arm`) and `win32-x64` — and runs `upland --version` on the binary it just built. Linux is statically linked against musl so an older glibc host can start it.
 4. `package` writes one `upland-<version>-<target>.tar.gz` per Homebrew target (single member, mode `0755`, uid/gid 0, mtime at the epoch, so republishing hashes identically), `upland-<version>-win32-x64.exe`, and `SHA256SUMS`, and attaches [`scripts/install.sh`](scripts/install.sh) verbatim as the versionless `install.sh` asset (not in the checksum manifest — the manifest names artifacts, and the script is transport).

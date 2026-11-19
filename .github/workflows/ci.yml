@@ -1,6 +1,13 @@
 name: CI
 
+# Two lanes, one merge, one gate: Web and Rust run in parallel and never talk
+# to each other; Packaging merges them — asserting the repo's shell contracts,
+# and the crate's file listing against the SPA bundle the Web lane built; Gate
+# is the run's single green statement, coloured by the lane results handed to
+# its summary script.
+
 on:
+  pull_request:
   push:
     branches: [ main ]
 
@@ -9,21 +16,8 @@ env:
   RUSTFLAGS: -Dwarnings
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo check --locked --all-targets
-      - run: cargo clippy --locked --all-targets
-
-  frontend:
-    name: Frontend
+  web:
+    name: Web
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -43,27 +37,67 @@ jobs:
           name: web-dist
           path: web/dist
 
-  packaging:
-    name: Packaging
+  rust:
+    name: Rust
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # One lane, one job, steps in sequence: fmt and clippy fail the lane
+      # before the test build is paid for, and a single checkout and cache
+      # restore serve every step. No SPA bundle is staged: the
+      # embedded-SPA-serving tests print their SKIPPING notice in CI, by
+      # decision — Packaging proves below that the bundle is what ships.
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets
+      - run: cargo test --locked --all-targets
+
+  packaging:
+    name: Packaging
+    runs-on: ubuntu-latest
+    needs: [ web, rust ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The merge consumes the Web lane's SPA bundle: it can only assert what
+      # the packer will really carry over a staged web/dist, and staging it
+      # here is what earns this job its position after both lanes.
+      - uses: actions/download-artifact@v4
+        with:
+          name: web-dist
+          path: web/dist
+
       # GNU tar is what the org tap's contract is written with, and this
       # repository's tarballs are packed by it on Linux, so the assertions run
       # here rather than in cargo test, where a developer's tar is bsdtar.
       - name: Assert the brew tarball contract
         run: bash scripts/test-package-brew-tarball.sh
 
-  test:
-    name: Test
+      - name: Assert the gate summary contract
+        run: bash scripts/test-ci-gate-summary.sh
+
+      # The crate must ship what every other channel ships: the staged SPA
+      # bundle, the migrations, and the offline query metadata. Before this
+      # ran only mid-release, after the bump; a packaging mistake now costs a
+      # red CI run, not a version to explain (ADR-0006).
+      - name: Assert the crate packaging
+        run: bash scripts/assert-crate-packaging.sh
+
+  gate:
+    name: Gate
     runs-on: ubuntu-latest
-    needs: frontend
+    needs: [ web, rust, packaging ]
+    # always(): a red lane skips this job without it, and a skipped Gate is
+    # silent — with it, the Gate stays the one place the run reports itself.
+    if: always()
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          name: web-dist
-          path: web/dist
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --locked --all-targets
+      - name: Summarise the run, colour the gate
+        run: |
+          bash scripts/ci-gate-summary.sh \
+            "Web=${{ needs.web.result }}" \
+            "Rust=${{ needs.rust.result }}" \
+            "Packaging=${{ needs.packaging.result }}"

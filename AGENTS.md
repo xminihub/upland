@@ -17,7 +17,7 @@ Frontend (`web/`, Bun; CI pins bun 1.4.4):
 - `bun run build` — typecheck + production build into `web/dist`
 - `bun run dev` — Vite dev server on :5173, proxies `/api` to 127.0.0.1:8080
 
-All HTTP behavior is tested through the in-process router seam (see `tests/`); tests must not open real sockets. SPA-serving tests skip when `web/dist` is empty; run `bun run build` first to exercise them locally (the CI test job consumes the frontend job's build artifact).
+All HTTP behavior is tested through the in-process router seam (see `tests/`); tests must not open real sockets. SPA-serving tests skip when `web/dist` is empty; run `bun run build` first to exercise them locally. CI's Rust lane stages no bundle, so they skip there by decision; the `packaging` merge job asserts the crate carries the bundle the `web` lane built (`scripts/assert-crate-packaging.sh`).
 
 Distribution (`scripts/`, shell + jq):
 
@@ -26,7 +26,8 @@ Distribution (`scripts/`, shell + jq):
 - `scripts/package-brew-tarball.sh` — one deterministic tarball per Homebrew target; needs GNU tar (`brew install gnu-tar`, then `TAR=gtar`)
 - `scripts/install-musl-toolchain.sh` — pins and installs zig and `cargo-zigbuild`, the C toolchain the two `*-musl` targets build the bundled SQLite and link with; `release.yml` runs it before those builds
 - `scripts/install.sh` — the **installer** (ADR-0006): POSIX sh, Linux/macOS, checksum-verified, installs to `~/.local/bin`; shipped byte-for-byte as the versionless `install.sh` release asset and deliberately ungated by CI — its first run against real assets is its first test
-- `bash scripts/test-package-brew-tarball.sh` — the packaging contract, asserted; CI's `packaging` job runs it on Ubuntu, and it is deliberately not a `cargo test`
+- `bash scripts/test-package-brew-tarball.sh` — the packaging contract, asserted; CI's `packaging` merge job (Web ∥ Rust → Packaging → Gate) runs it on Ubuntu, and it is deliberately not a `cargo test`
+- `scripts/ci-gate-summary.sh` — the `gate` job's whole content: renders the run summary and colours the gate from the lane results; `bash scripts/test-ci-gate-summary.sh` asserts that contract from the same shell-contract seam, run beside the tarball contract
 - `Formula/upland.rb` and the Ruby template live in `xminihub/homebrew-tap`, not here; the release dispatches that repository's `bump.yml` and waits for it (ADR-0001). The tap's upland seed files (`tools/upland.json`, `templates/upland.rb.tpl`) were onboarded per ADR-0006
 - The release chain reads as the channel priority: `github-release → tap → cargo`. The cargo job stages the `web-dist` artifact into `web/dist`, asserts the crate listing, and publishes with the `CARGO_REGISTRY_TOKEN` secret (publish-only, must exist before the first release carrying this job); an already-published version is skipped, not failed — registry versions are one-shot (ADR-0006)
 
