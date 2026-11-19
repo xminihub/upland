@@ -433,30 +433,11 @@ jobs:
       - name: Assert the crate packaging
         run: bash scripts/assert-crate-packaging.sh
 
+      # The publish itself is the script CI's packaging job dry-runs, so the
+      # command that can burn a one-shot registry version is one derivation,
+      # already proven green before any tag exists.
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          VERSION: ${{ needs.release.outputs.version }}
-        run: |
-          set -euo pipefail
-          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
-            echo "::error::the CARGO_REGISTRY_TOKEN secret is not configured; the cargo channel cannot publish"
-            exit 1
-          fi
-          # Already-published is a skip, not a failure: this pipeline's
-          # repair contract is re-dispatch, and a re-dispatch cannot un- or
-          # re-publish a registry version. The sparse index answers; a missing
-          # crate answers as nothing-published, which is the first release.
-          # (jq without -e: `-e` exits 1 when the test is false, which
-          # `set -e` here would take as the very failure it is testing for.)
-          index="$(curl -fsS https://index.crates.io/up/la/upland || true)"
-          published="$(printf '%s' "$index" | jq -s --arg v "$VERSION" 'any(.[]; .vers == $v)')"
-          if [ "$published" = "true" ]; then
-            echo "::notice::upland $VERSION is already on crates.io — publish skipped"
-          else
-            # No --allow-dirty: a published version is forever, and the
-            # registry must only ever hold what a clean tag checkout produced
-            # — the staged web-dist is gitignored and cannot dirty this tree.
-            cargo publish --locked
-          fi
+        run: bash scripts/publish-crate.sh "${{ needs.release.outputs.version }}"
 

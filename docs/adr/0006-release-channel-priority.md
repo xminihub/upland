@@ -112,13 +112,27 @@ can reach a release broken, and the first discovery is that user's.
   artifact verify already built — the same bytes every target embeds, per
   0001's one-build-feeds-all — and the manifest's `include` whitelist pulls
   the gitignored bundle into the package. The precedence (whitelist beats
-  gitignore) was proven mechanically on the current tree, not assumed;
-  if it ever inverts, the fallback is staging the bundle at a non-ignored
-  path, with the embed location unchanged.
+  gitignore) was proven mechanically on the current tree, not assumed.
+- **The publish commits the staged bundle** (`scripts/publish-crate.sh`), in
+  the runner's checkout only, never pushed. Release run 44333475787 (v0.1.6)
+  went green through the release and the tap and died here: cargo counts every
+  packaged file git has not committed as an uncommitted change, and the
+  whitelist packages `web/dist` whatever `.gitignore` says, so a clean tag
+  checkout plus the artifact still refused to publish, on 24 bundle files.
+  Committing the bundle keeps cargo's own clean-tree check as the guard;
+  `--allow-dirty` would have waived it for every other file the registry
+  receives. The fallback the draft of this ADR named for a precedence
+  inversion — staging the bundle at a non-ignored path — would not have helped
+  either: packaged-but-untracked files fail the same check, tested on the tag
+  tree.
 - **Packaging mistakes never burn a version**: verify gained a pre-bump
   gate asserting the packager's file listing carries `web/dist/index.html`,
   `migrations/` and `.sqlx/`, and the cargo job asserts the same listing
-  again before publishing.
+  again before publishing. The listing was never the whole contract — v0.1.6
+  proved a correct listing can still refuse to publish — so CI's `packaging`
+  merge job dry-runs the publish itself, the same script the cargo job runs,
+  and a refusal of this kind now costs a red run instead of a half-released
+  version.
 - Auth is a publish-only API token in the `CARGO_REGISTRY_TOKEN` secret;
   a missing secret fails the job with a named reason.
 - **No backfill**: `upland` enters the registry with the next CI release.
