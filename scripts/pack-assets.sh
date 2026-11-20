@@ -72,11 +72,9 @@ if [ -z "$version" ]; then
     exit 2
 fi
 
-if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
-    echo "pack-assets: not a release version: $version (a tag is v<version>, an asset is not)" >&2
-    exit 1
-fi
-
+# The version's shape is not re-checked here: every name and tarball this
+# packer drives goes through asset-name.sh, which owns that rule, and refuses
+# a non-release version by name.
 mkdir -p "$assets_dir" "$(dirname "$manifest")" "$(dirname "$notes")"
 : > "$manifest"
 
@@ -133,7 +131,7 @@ cp "$installer" "$assets_dir/install.sh"
     echo
     echo "| Target | Rust triple | Ships as |"
     echo "| --- | --- | --- |"
-    jq -r '.targets[] | "| \(.name) | `\(.rustTarget)` | \(if .brew then "brew tarball" else "release asset" end) |"' "$table"
+    jq -r '.targets[] | "| \(.name) | `\(.rustTarget)` | \(if .brew then "tarball asset" else "the binary itself" end) |"' "$table"
 } > "$notes"
 
 echo "pack-assets: $(jq -sr 'length' "$manifest") assets in $assets_dir, records in $manifest, notes in $notes" >&2

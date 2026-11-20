@@ -36,6 +36,11 @@ case "$bump" in
         ;;
 esac
 
+if ! command -v jq >/dev/null 2>&1; then
+    echo "bump-and-tag: jq is required" >&2
+    exit 1
+fi
+
 if ! cargo set-version --help >/dev/null 2>&1; then
     echo "bump-and-tag: cargo set-version is required (cargo install cargo-edit --version 0.13.13 --locked)" >&2
     exit 1

@@ -45,9 +45,14 @@ jobs:
       # The table is the matrix (ADR-0001): validated first, before any
       # toolchain is installed, so a broken row costs seconds. The emitted
       # JSON feeds the build matrix below — there is no reader job anymore.
+      # The assignment form is load-bearing: a command substitution inside
+      # echo's arguments does not trip `bash -e`, and a swallowed refusal
+      # here would bump a version over a broken table.
       - name: Check the target table
         id: table
-        run: echo "matrix=$(bash scripts/check-targets.sh)" >> "$GITHUB_OUTPUT"
+        run: |
+          matrix="$(bash scripts/check-targets.sh)"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -238,6 +243,12 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.TAP_TRIGGER_TOKEN }}
     steps:
+      # The script lives in the tree, so this job checks the released ref
+      # out like package and cargo do; gh still talks to the tap through
+      # --repo and the Actions-only token, never through this checkout.
+      - uses: actions/checkout@v4
+        with:
+          ref: v${{ needs.release.outputs.version }}
       - name: Bump the tap and pin the formula
         run: bash scripts/bump-tap.sh --repo xminihub/homebrew-tap --tool upland --version "${{ needs.release.outputs.version }}"
 

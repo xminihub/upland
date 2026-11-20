@@ -60,8 +60,12 @@ rust_target="$(jq -r '.rustTarget' <<<"$row")"
 deployment="$(jq -r '.deploymentTarget // ""' <<<"$row")"
 if [ "$(jq -r '.exe' <<<"$row")" = "true" ]; then
     output="./target/$rust_target/release/upland.exe"
+    exists() { [ -f "$1" ]; }
+    missing="missing"
 else
     output="./target/$rust_target/release/upland"
+    exists() { [ -x "$1" ]; }
+    missing="missing or not executable"
 fi
 
 case "$rust_target" in
@@ -74,9 +78,8 @@ fi
 "$@" --release --locked --target "$rust_target"
 
 # The smoke: the artifact exists, runs, and names this release.
-if [ "$(jq -r '.exe' <<<"$row")" = "true" ]; then
-    [ -f "$output" ] || { echo "build-target: missing: $output" >&2; exit 1; }
-else
-    [ -x "$output" ] || { echo "build-target: missing or not executable: $output" >&2; exit 1; }
+if ! exists "$output"; then
+    echo "build-target: $missing: $output" >&2
+    exit 1
 fi
 echo "$("$output" --version)" | grep -Fx "upland $version"
