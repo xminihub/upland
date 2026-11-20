@@ -101,3 +101,32 @@ fn an_explicit_config_path_is_never_generated() {
     assert!(error.contains("nowhere.json"), "{error}");
     assert!(!target.exists());
 }
+
+#[test]
+fn two_threads_booting_a_fresh_default_directory_agree_on_one_secret() {
+    // The ADR-0005 publish promise under real concurrency: exactly one
+    // document survives, and both boots mint with the secret it holds.
+    let dir = std::sync::Arc::new(TestDataDir::new("concurrent"));
+    let pairs = std::sync::Arc::new(env_from(&dir.home(), "8114"));
+
+    let boots = [0u8, 1].map(|_| {
+        let pairs = std::sync::Arc::clone(&pairs);
+        std::thread::spawn(move || {
+            upland::Config::from_args(Vec::<String>::new(), |key| {
+                pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+            })
+            .expect("booting thread")
+        })
+    });
+    let [first, second] = boots;
+    let first = first.join().expect("boot");
+    let second = second.join().expect("boot");
+
+    assert_eq!(first.signing_secret.hex(), second.signing_secret.hex());
+    let contents = std::fs::read_to_string(&first.config_path).expect("one file");
+    let document: serde_json::Value = serde_json::from_str(&contents).expect("never torn");
+    assert_eq!(
+        document["auth"]["jwt_secret"].as_str().unwrap(),
+        first.signing_secret.hex()
+    );
+}

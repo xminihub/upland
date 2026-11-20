@@ -61,7 +61,6 @@ describe("Login screen", () => {
       "/api/v1/hello": () => Response.json({ message: "Hello from upland!" }),
       "/api/v1/auth/me": () =>
         Response.json({
-          id: 1,
           username: "reta",
           email: "reta@example.com",
           identities: [],
@@ -144,7 +143,6 @@ describe("Sign up screen", () => {
       "/api/v1/hello": () => Response.json({ message: "Hello from upland!" }),
       "/api/v1/auth/me": () =>
         Response.json({
-          id: 2,
           username: "fresh_one",
           email: "fresh@example.com",
           identities: [],
@@ -178,7 +176,6 @@ describe("The signed-in browser", () => {
       "/api/v1/hello": () => Response.json({ message: "Hello from upland!" }),
       "/api/v1/auth/me": () =>
         Response.json({
-          id: 1,
           username: "tess",
           email: "tess@example.com",
           identities: ["work"],
@@ -208,7 +205,6 @@ describe("The signed-in browser", () => {
       "/api/v1/hello": () => Response.json({ message: "Hello from upland!" }),
       "/api/v1/auth/me": () =>
         Response.json({
-          id: 1,
           username: "tess",
           email: "tess@example.com",
           identities: [],
@@ -231,7 +227,6 @@ describe("The signed-in browser", () => {
       "/api/v1/hello": () => Response.json({ message: "Hello from upland!" }),
       "/api/v1/auth/me": () =>
         Response.json({
-          id: 1,
           username: "tess",
           email: "tess@example.com",
           identities: [],
@@ -360,7 +355,6 @@ describe("OIDC sign-in", () => {
       "/api/v1/hello": () => Response.json({ message: "Hello from upland!" }),
       "/api/v1/auth/me": () =>
         Response.json({
-          id: 1,
           username: "tess",
           email: "tess@example.com",
           identities: ["work"],

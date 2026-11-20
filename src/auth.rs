@@ -5,9 +5,11 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// Every token's `iss` and `aud`: an upland token is for upland and
-/// comes from upland. The audience check is what keeps symmetric-key
-/// tokens from crossing audit boundaries.
+/// Every upland token names itself as both `iss` and `aud` (ADR-0004):
+/// an upland token is for upland and comes from upland. Two constants
+/// because the two claims answer two different questions — who signed
+/// this, and who may accept it.
+pub const TOKEN_ISSUER: &str = "upland";
 pub const TOKEN_AUDIENCE: &str = "upland";
 
 #[derive(Clone)]
@@ -102,7 +104,7 @@ impl AccessTokenIssuer {
     pub fn mint_at(&self, subject: &str, now: i64) -> Result<String, String> {
         let claims = Claims {
             sub: subject.to_owned(),
-            iss: TOKEN_AUDIENCE.to_owned(),
+            iss: TOKEN_ISSUER.to_owned(),
             aud: TOKEN_AUDIENCE.to_owned(),
             iat: now,
             exp: now.saturating_add(self.ttl_seconds),
@@ -127,7 +129,7 @@ impl AccessTokenIssuer {
         let claims = jsonwebtoken::decode::<Claims>(token, &key, &validation)
             .map_err(|error| VerifyError::Format(error.to_string()))?
             .claims;
-        if claims.iss != TOKEN_AUDIENCE {
+        if claims.iss != TOKEN_ISSUER {
             return Err(VerifyError::Issuer);
         }
         if claims.exp <= now {
@@ -169,7 +171,7 @@ mod tests {
         let token = issuer.mint_at("42", 1_000_000).expect("mint");
         let claims = issuer.verify_at(&token, 1_000_001).expect("verify");
         assert_eq!(claims.sub, "42");
-        assert_eq!(claims.iss, TOKEN_AUDIENCE);
+        assert_eq!(claims.iss, TOKEN_ISSUER);
         assert_eq!(claims.aud, TOKEN_AUDIENCE);
         assert_eq!(claims.iat, 1_000_000);
         assert_eq!(claims.exp, 1_003_600);
@@ -207,7 +209,7 @@ mod tests {
             &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
             &Claims {
                 sub: "1".to_owned(),
-                iss: TOKEN_AUDIENCE.to_owned(),
+                iss: TOKEN_ISSUER.to_owned(),
                 aud: "somewhere-else".to_owned(),
                 iat: 500,
                 exp: 560,

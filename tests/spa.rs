@@ -14,7 +14,7 @@ async fn test_server() -> TestServer {
             3600,
         ),
         oidc_providers: vec![],
-        id_tokens: upland::oidc::IdTokenValidator::Fixed(Default::default()),
+        id_tokens: upland::oidc::IdTokenValidator::Offline(Default::default()),
     }))
 }
 

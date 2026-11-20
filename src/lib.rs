@@ -418,7 +418,6 @@ async fn me(
     (
         StatusCode::OK,
         Json(json!({
-            "id": account.id,
             "username": account.username,
             "email": account.email,
             "identities": identities
@@ -1912,7 +1911,7 @@ mod tests {
                 3600,
             ),
             oidc_providers: vec![],
-            id_tokens: crate::oidc::IdTokenValidator::Fixed(Default::default()),
+            id_tokens: crate::oidc::IdTokenValidator::Offline(Default::default()),
         }
     }
 }

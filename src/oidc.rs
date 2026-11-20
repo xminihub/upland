@@ -3,23 +3,29 @@
 //! The browser runs discovery + PKCE and hands the ID token over; this
 //! module decides whether the ID token really came from the configured
 //! **provider** and what it asserts. Tests never open a socket
-//! (AGENTS.md), so production verification lives behind
-//! [`IdTokenValidator::Live`] and the router-seam tests inject
-//! [`IdTokenValidator::Fixed`] fixtures.
+//! (AGENTS.md) — so the Live validator fetches discovery and keys over
+//! the network, while the Offline validator receives them as fixtures
+//! recorded into its own arguments. What never changes is where the
+//! decision is made: the openidconnect crate verifies signature,
+//! issuer, audience and expiry in both paths; only the key material's
+//! provenance differs (spec #13: "our logic is tested, the crate's
+//! crypto is trusted").
 
 use std::collections::HashMap;
 
-use openidconnect::core::{CoreIdToken, CoreIdTokenClaims, CoreJsonWebKey, CoreProviderMetadata};
+use openidconnect::core::{CoreIdToken, CoreJsonWebKey, CoreProviderMetadata};
 use openidconnect::{ClientId, IdTokenVerifier, IssuerUrl, JsonWebKeySet, Nonce};
 
-/// What a verified ID token asserts: the identity's subject plus whatever
-/// email the provider vouches for. `email_verified` is deliberately not
-/// modelled — ADR-0004 links on email regardless, because the configured
-/// issuer is the operator's trust decision.
+/// What a verified ID token asserts. `email_verified` is read into the
+/// record but *never consulted* for linking (ADR-0004): the configured
+/// issuer is the operator's trust decision, and a lax IdP's over-claim
+/// is an operator risk, not a code rule. Modelling it keeps the tests
+/// honest about ignoring it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedIdentity {
     pub subject: String,
     pub email: Option<String>,
+    pub email_verified: Option<bool>,
 }
 
 #[derive(Debug)]
@@ -41,13 +47,13 @@ impl std::fmt::Display for OidcRejection {
 
 #[derive(Clone)]
 pub enum IdTokenValidator {
-    /// Full validation through the openidconnect crate: signature via the
-    /// issuer's published keys, issuer, audience, expiry — correct by
-    /// following the spec rather than by our tests.
+    /// Keys are fetched from the issuer's own endpoints at verification
+    /// time: production.
     Live,
-    /// Recorded answers for tests, keyed by provider name then token
-    /// string. Anything not in the table is rejected like a forgery.
-    Fixed(HashMap<String, HashMap<String, VerifiedIdentity>>),
+    /// Keys as arguments, keyed by provider name. The token still walks
+    /// the crate's full verification — only discovery is offline. For
+    /// tests and air-gapped fixtures.
+    Offline(HashMap<String, JsonWebKeySet<CoreJsonWebKey>>),
 }
 
 impl IdTokenValidator {
@@ -57,33 +63,44 @@ impl IdTokenValidator {
         id_token: &str,
         forwarded_nonce: Option<&str>,
     ) -> Result<VerifiedIdentity, OidcRejection> {
-        match self {
-            IdTokenValidator::Fixed(by_provider) => by_provider
+        let jwks = match self {
+            IdTokenValidator::Live => fetch_live_keys(provider).await?,
+            IdTokenValidator::Offline(by_provider) => by_provider
                 .get(&provider.name)
-                .and_then(|tokens| tokens.get(id_token))
                 .cloned()
-                .ok_or(OidcRejection::MalformedToken),
-            IdTokenValidator::Live => validate_live(provider, id_token, forwarded_nonce).await,
-        }
+                .ok_or(OidcRejection::NoKeys)?,
+        };
+        verify_with_keys(provider, &jwks, id_token, forwarded_nonce)
     }
 }
 
-async fn validate_live(
+async fn fetch_live_keys(
     provider: &crate::OidcProvider,
+) -> Result<JsonWebKeySet<CoreJsonWebKey>, OidcRejection> {
+    let issuer = IssuerUrl::new(provider.issuer.clone())
+        .map_err(|error| OidcRejection::Verification(error.to_string()))?;
+    let http = openidconnect::reqwest::Client::new();
+    let metadata = CoreProviderMetadata::discover_async(issuer, &http)
+        .await
+        .map_err(|error| OidcRejection::Verification(error.to_string()))?;
+    JsonWebKeySet::<CoreJsonWebKey>::fetch_async(metadata.jwks_uri(), &http)
+        .await
+        .map_err(|error| OidcRejection::Verification(error.to_string()))
+}
+
+fn verify_with_keys(
+    provider: &crate::OidcProvider,
+    jwks: &JsonWebKeySet<CoreJsonWebKey>,
     id_token: &str,
     forwarded_nonce: Option<&str>,
 ) -> Result<VerifiedIdentity, OidcRejection> {
     let issuer = IssuerUrl::new(provider.issuer.clone())
         .map_err(|error| OidcRejection::Verification(error.to_string()))?;
-    let http = openidconnect::reqwest::Client::new();
-    let metadata = CoreProviderMetadata::discover_async(issuer.clone(), &http)
-        .await
-        .map_err(|error| OidcRejection::Verification(error.to_string()))?;
-    let jwks = JsonWebKeySet::<CoreJsonWebKey>::fetch_async(metadata.jwks_uri(), &http)
-        .await
-        .map_err(|error| OidcRejection::Verification(error.to_string()))?;
-    let verifier =
-        IdTokenVerifier::new_public_client(ClientId::new(provider.client_id.clone()), issuer, jwks);
+    let verifier = IdTokenVerifier::new_public_client(
+        ClientId::new(provider.client_id.clone()),
+        issuer,
+        jwks.clone(),
+    );
     let token = id_token
         .parse::<CoreIdToken>()
         .map_err(|_| OidcRejection::MalformedToken)?;
@@ -99,16 +116,14 @@ async fn validate_live(
             .claims(&verifier, accept_any_nonce)
             .map_err(|error| OidcRejection::Verification(error.to_string()))?,
     };
-    Ok(verified(claims))
-}
 
-fn verified(claims: &CoreIdTokenClaims) -> VerifiedIdentity {
-    VerifiedIdentity {
+    Ok(VerifiedIdentity {
         subject: claims.subject().as_str().to_owned(),
         email: claims
             .email()
             .map(|email| email.as_str().trim().to_lowercase()),
-    }
+        email_verified: claims.email_verified(),
+    })
 }
 
 fn accept_any_nonce(_: Option<&Nonce>) -> Result<(), String> {

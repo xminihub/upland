@@ -13,7 +13,7 @@ async fn test_state() -> upland::AppState {
         db: std::sync::Arc::new(db),
         access_tokens: upland::auth::AccessTokenIssuer::new(test_secret(), 3600),
         oidc_providers: vec![],
-        id_tokens: upland::oidc::IdTokenValidator::Fixed(Default::default()),
+        id_tokens: upland::oidc::IdTokenValidator::Offline(Default::default()),
     }
 }
 
@@ -442,7 +442,6 @@ async fn me_answers_the_account_it_was_minted_for() {
     assert_eq!(
         response.json::<Value>(),
         json!({
-            "id": 1,
             "username": "tess",
             "email": "tess@example.com",
             "identities": []
