@@ -1,5 +1,13 @@
 name: Release
 
+# One line, seven jobs: verify → release → build → package → github-release →
+# tap → cargo. The sequence is the doctrine: every gate runs before the bump,
+# so a red release leaves no version to explain (ADR-0001), and the tail is
+# the channel order — binary, then tap, then crate — so the one-shot registry
+# version burns only after every higher channel is green (ADR-0006). Each job
+# runs a script; the YAML is wiring: checkouts, toolchains, artifact transfer.
+# The rationale lives beside the logic it explains, in scripts/.
+
 on:
   workflow_dispatch:
     inputs:
@@ -12,8 +20,10 @@ on:
           - minor
           - major
 
+# Least privilege as the floor; only the two jobs that write to the repository
+# say so on purpose.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release
@@ -23,43 +33,22 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  targets:
-    name: Read the target table
+  verify:
+    name: Verify
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       matrix: ${{ steps.table.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
-      # The table is the matrix: one file decides which targets exist, where
-      # each is built and what its artifacts are called (ADR-0001). A row that
-      # cannot become a job is a broken table, not a partial release.
-      - name: Validate and emit the matrix
-        id: table
-        run: |
-          set -euo pipefail
-          jq -e '.bin == "upland"' scripts/targets.json >/dev/null
-          jq -e '.targets | length > 0' scripts/targets.json >/dev/null
-          jq -e 'all(.targets[];
-            .name and .rustTarget and .runner and (.brew != null) and (.exe != null))' \
-            scripts/targets.json >/dev/null
-          jq -e '(.targets | map(.name) | length) == (.targets | map(.name) | unique | length)' \
-            scripts/targets.json >/dev/null
-          jq -e '[.targets[] | select(.brew)] | length > 0' scripts/targets.json >/dev/null
-          # A brew target the org tap cannot render fails its bump by name; the
-          # os/cpu halves are checked here so a bad row costs a minute, not a
-          # published release.
-          jq -e 'all(.targets[] | select(.brew);
-            (.name | split("-")) as [$os, $cpu] |
-            ($os == "darwin" or $os == "linux") and ($cpu == "arm64" or $cpu == "x64"))' \
-            scripts/targets.json >/dev/null
-          echo "matrix=$(jq -c '.targets' scripts/targets.json)" >> "$GITHUB_OUTPUT"
-          jq -r '.targets[].name' scripts/targets.json
 
-  verify:
-    name: Verify
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      # The table is the matrix (ADR-0001): validated first, before any
+      # toolchain is installed, so a broken row costs seconds. The emitted
+      # JSON feeds the build matrix below — there is no reader job anymore.
+      - name: Check the target table
+        id: table
+        run: echo "matrix=$(bash scripts/check-targets.sh)" >> "$GITHUB_OUTPUT"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -83,6 +72,7 @@ jobs:
         with:
           name: web-dist
           path: web/dist
+          retention-days: 7
 
       - name: Rust
         env:
@@ -92,20 +82,18 @@ jobs:
           cargo clippy --locked --all-targets
           cargo test --locked --all-targets
 
-      # The crate must ship what every other channel ships: the SPA bundle
-      # staged by the frontend build above, the migrations, and the offline
-      # query metadata. Asserted before the bump because a red release must
-      # leave no version to explain (ADR-0006); the cargo job calls the same
-      # script again before publishing.
       - name: Assert the crate packaging
         run: bash scripts/assert-crate-packaging.sh
 
   release:
     name: Bump & Tag
-    runs-on: ubuntu-latest
     needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
     outputs:
-      version: ${{ steps.version.outputs.version }}
+      version: ${{ steps.bump.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -114,39 +102,25 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-edit --version 0.13.13 --locked
 
-      - name: Bump version
-        run: cargo set-version --bump ${{ inputs.bump }}
-
-      - name: Read version
-        id: version
+      # The one job that moves main and cuts tags. Everything that must be
+      # green before a version may exist has run by now; see the script.
+      - name: Bump, tag, push
+        id: bump
         run: |
-          VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-      - name: Configure git
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-      - name: Commit & tag
-        run: |
-          git add Cargo.toml Cargo.lock
-          git commit -m "release: v${{ steps.version.outputs.version }}"
-          git tag "v${{ steps.version.outputs.version }}"
-
-      - name: Push to GitHub
-        run: |
-          git push origin main
-          git push origin "v${{ steps.version.outputs.version }}"
+          version="$(bash scripts/bump-and-tag.sh --bump "${{ inputs.bump }}")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.name }}
-    needs: [targets, verify, release]
+    needs: [verify, release]
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
-      fail-fast: false
+      # A broken target stops the fleet: a red release should stop early,
+      # not harvest a full set of partial artifacts.
+      fail-fast: true
       matrix:
-        include: ${{ fromJSON(needs.targets.outputs.matrix) }}
+        include: ${{ fromJSON(needs.verify.outputs.matrix) }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -164,153 +138,75 @@ jobs:
           path: web/dist
 
       # The x86_64 slice is cross-compiled on an arm64 runner, and it is also
-      # run there: the smoke step below proves the artifact starts, which needs
-      # Rosetta. A runner that cannot install it fails here instead of shipping
-      # an unrun Intel binary.
+      # run there: the smoke inside build-target.sh proves the artifact
+      # starts, which needs Rosetta. A runner that cannot install it fails
+      # here instead of shipping an unrun Intel binary.
       - name: Install Rosetta (x86_64 macOS builds)
         if: matrix.rosetta
         run: sudo softwareupdate --install-rosetta --agree-to-license
 
-      # Bundled SQLite is C, and a static musl link needs a C compiler for the
-      # musl triple: the Ubuntu runners have neither x86_64-linux-musl-gcc nor
-      # aarch64-linux-musl-gcc, so the musl targets build through zig cc, which
-      # cargo zigbuild passes to the compile and the link alike (ADR-0001).
+      # Bundled SQLite is C, and the static musl link needs a musl C compiler
+      # the Ubuntu runners do not ship (ADR-0001).
       - name: Install the musl toolchain
         if: endsWith(matrix.rustTarget, '-musl')
         run: bash scripts/install-musl-toolchain.sh
 
-      - name: Build
+      # Build and smoke as one contract, straight off the table row: the
+      # binary must run and must name this release before anything packages
+      # it (ADR-0001).
+      - name: Build & smoke
         shell: bash
-        env:
-          RUST_TARGET: ${{ matrix.rustTarget }}
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deploymentTarget }}
-        run: |
-          set -euo pipefail
-          case "$RUST_TARGET" in
-            *-musl) set -- cargo zigbuild ;;
-            *) set -- cargo build ;;
-          esac
-          "$@" --release --locked --target "$RUST_TARGET"
+        run: bash scripts/build-target.sh --target "${{ matrix.name }}" --version "${{ needs.release.outputs.version }}"
 
-      - name: Smoke (Unix)
-        if: runner.os != 'Windows'
-        run: |
-          set -euo pipefail
-          output="./target/${{ matrix.rustTarget }}/release/upland"
-          [ -x "$output" ] || { echo "missing or not executable: $output"; exit 1; }
-          echo "$("$output" --version)" | grep -Fx "upland ${{ needs.release.outputs.version }}"
-
-      - name: Smoke (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          output="./target/${{ matrix.rustTarget }}/release/upland.exe"
-          [ -f "$output" ] || { echo "missing: $output"; exit 1; }
-          echo "$("$output" --version)" | grep -Fx "upland ${{ needs.release.outputs.version }}"
-
-      # The packaged artifact keeps the compiler's file name; scripts/asset-name.sh
-      # on Linux gives it its release name and, for brew targets, its tarball, so
-      # the vocabulary has exactly one home (ADR-0001).
       - uses: actions/upload-artifact@v4
         with:
           name: binary-${{ matrix.name }}
           path: target/${{ matrix.rustTarget }}/release/upland${{ matrix.exe && '.exe' || '' }}
+          retention-days: 7
 
   package:
     name: Package release assets
-    needs: [targets, verify, release, build]
+    needs: [release, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           ref: v${{ needs.release.outputs.version }}
 
+      # merge-multiple stays off: every target's binary is named `upland`, so
+      # merging them into one directory would leave only one of them.
       - uses: actions/download-artifact@v4
-        # merge-multiple stays off: every target's binary is named `upland`, so
-        # merging them into one directory would leave only one of them.
         with:
           pattern: binary-*
           path: dist/binaries
           merge-multiple: false
 
-      # The packer prints the asset name, path and sha256 it wrote. Those
-      # records, not a second reading of the directory, are what the checksums
-      # file and the guard below use: one derivation per fact (ADR-0001).
-      - name: Pack one tarball per brew target
-        run: |
-          set -euo pipefail
-          version="${{ needs.release.outputs.version }}"
-          : > dist/manifest.jsonl
-          for target in $(jq -r '.targets[] | select(.brew) | .name' scripts/targets.json); do
-            bash scripts/package-brew-tarball.sh \
-              --binary "dist/binaries/binary-$target/upland" \
-              --version "$version" \
-              --target "$target" \
-              --dir dist/assets | tee -a dist/manifest.jsonl
-          done
+      - name: Pack the release assets
+        run: bash scripts/pack-assets.sh --version "${{ needs.release.outputs.version }}"
 
-      - name: Name the Windows executable
-        run: |
-          set -euo pipefail
-          version="${{ needs.release.outputs.version }}"
-          for target in $(jq -r '.targets[] | select(.exe) | .name' scripts/targets.json); do
-            asset="$(bash scripts/asset-name.sh --version "$version" --target "$target" --kind binary)"
-            cp "dist/binaries/binary-$target/upland.exe" "dist/assets/$asset"
-            jq -cn --arg asset "$asset" \
-              --arg path "$PWD/dist/assets/$asset" \
-              --arg sha256 "$(sha256sum "dist/assets/$asset" | cut -d' ' -f1)" \
-              '{asset: $asset, path: $path, sha256: $sha256}' >> dist/manifest.jsonl
-          done
+      - name: Assert the asset set
+        run: bash scripts/assert-assets.sh
 
-      - name: Write SHA256SUMS
-        # Covers every asset published, tarballs and the Windows executable
-        # alike: the file names the exact bytes a channel installed.
-        run: |
-          set -euo pipefail
-          jq -sr 'sort_by(.asset)[] | "\(.sha256)  \(.asset)"' dist/manifest.jsonl > dist/assets/SHA256SUMS
-          cat dist/assets/SHA256SUMS
-
-      - name: Every target in the table has an asset, and the hashes hold
-        run: |
-          set -euo pipefail
-          expected="$(jq -r '.targets | length' scripts/targets.json)"
-          actual="$(jq -sr 'length' dist/manifest.jsonl)"
-          [ "$expected" = "$actual" ] || {
-            echo "the manifest holds $actual assets, the target table has $expected targets"
-            exit 1
-          }
-          while IFS=$'\t' read -r asset path sha256; do
-            [ -s "$path" ] || { echo "missing or empty: $asset"; exit 1; }
-            actual="$(sha256sum "$path" | cut -d' ' -f1)"
-            [ "$actual" = "$sha256" ] || {
-              echo "sha256 moved for $asset: $actual != $sha256"
-              exit 1
-            }
-            echo "ok $asset"
-          done < <(jq -sr '.[] | [.asset, .path, .sha256] | @tsv' dist/manifest.jsonl)
-          ls -la dist/assets
-
-      # The installer ships versionless, byte-for-byte from scripts/install.sh:
-      # `releases/latest/download/install.sh` is a URL that never changes, and
-      # the repo copy is the source a user can read before piping it
-      # (ADR-0006). It is not in SHA256SUMS and not in the manifest — the
-      # checksum manifest names the bytes a channel installs, and the script
-      # is transport, not artifact — so the count guard above stays exact.
-      - name: Attach the installer asset
-        run: |
-          set -euo pipefail
-          cp scripts/install.sh dist/assets/install.sh
-
+      # The notes file and the manifest ride along with the assets so the
+      # publishing job has the body it publishes and the run keeps a record;
+      # only dist/assets is ever uploaded to the release itself.
       - uses: actions/upload-artifact@v4
         with:
           name: release-assets
-          path: dist/assets
+          path: |
+            dist/assets
+            dist/notes.md
+            dist/manifest.jsonl
+          retention-days: 30
 
   github-release:
     name: GitHub Release
     needs: [release, package]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -319,97 +215,37 @@ jobs:
 
       # No checkout: gh needs to know which repository it is talking to, and in
       # Actions GH_REPO says so without pulling the tree down for one command.
+      # The generated notes still come; the structured body states the asset
+      # set the manifest derived, which no autogenerated list can.
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          gh release create "v${{ needs.release.outputs.version }}" dist/* \
+          gh release create "v${{ needs.release.outputs.version }}" dist/assets/* \
             --title "v${{ needs.release.outputs.version }}" \
+            --notes-file dist/notes.md \
             --generate-notes
 
   tap:
     name: Bump org Homebrew tap
     needs: [release, github-release]
     runs-on: ubuntu-latest
+    # The timeout is what finally bounds the bump-run watch; see the script
+    # for why the formula read-back, not the run's conclusion, is the verdict.
+    timeout-minutes: 30
     env:
       GH_TOKEN: ${{ secrets.TAP_TRIGGER_TOKEN }}
-      TAP_REPO: xminihub/homebrew-tap
-      TOOL: upland
-      VERSION: ${{ needs.release.outputs.version }}
     steps:
-      # The tap owns Formula/upland.rb: this dispatches its bump workflow and
-      # waits for the run that bumps *this tool to this version*, then checks the
-      # formula itself. A release whose formula is not pinned is a red release
-      # rather than a discovery for a user (ADR-0001). The token is Actions-only
-      # on the tap: this job never holds content write access to it.
-      - name: Dispatch the formula bump
-        id: dispatch
-        run: |
-          set -euo pipefail
-          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          gh workflow run bump.yml --repo "$TAP_REPO" --ref main \
-            -f name="$TOOL" -f version="$VERSION"
-
-          # A dispatch is only recognisable as ours from its job name, "Bump
-          # <tool> to <version>": the run itself is titled after the workflow, so
-          # another tool's bump started in the same window would otherwise be
-          # watched and reported as ours.
-          run_id=""
-          for _ in $(seq 1 60); do
-            for candidate in $(gh run list --repo "$TAP_REPO" --workflow bump.yml \
-                --event workflow_dispatch --limit 10 \
-                --json databaseId,createdAt \
-                --jq "[.[] | select(.createdAt >= \"$started_at\")] | .[].databaseId"); do
-              if gh api "repos/$TAP_REPO/actions/runs/$candidate/jobs" \
-                  --jq '.jobs[].name' | grep -Fxq "Bump $TOOL to $VERSION"; then
-                run_id="$candidate"
-                break
-              fi
-            done
-            [ -n "$run_id" ] && break
-            sleep 5
-          done
-
-          if [ -z "$run_id" ]; then
-            echo "::error::no bump.yml run for $TOOL $VERSION started after $started_at"
-            exit 1
-          fi
-          echo "run_id=$run_id" >> "$GITHUB_OUTPUT"
-          echo "bump run: https://github.com/$TAP_REPO/actions/runs/$run_id"
-
-      - name: Confirm the formula pins this version
-        run: |
-          set -euo pipefail
-          if gh run watch "${{ steps.dispatch.outputs.run_id }}" \
-              --repo "$TAP_REPO" --exit-status --interval 20; then
-            concluded=success
-          else
-            concluded=failed
-          fi
-
-          # The run's conclusion is not the contract; a version pinned in
-          # Formula/upland.rb is. Reading the formula is what makes "a green
-          # release means an installable formula" true even if the watched run
-          # turned out not to be ours, or a repair re-dispatch already landed the
-          # same version.
-          pinned="$(gh api "repos/$TAP_REPO/contents/Formula/$TOOL.rb" --jq .content \
-            | base64 --decode | sed -n 's#.*/releases/download/v\([^/]*\)/.*#\1#p' | head -1)"
-
-          if [ "$pinned" = "$VERSION" ]; then
-            echo "Formula/$TOOL.rb pins $VERSION (bump run $concluded)"
-            [ "$concluded" = success ] ||
-              echo "::warning::the bump run $concluded, but the formula already pins $VERSION"
-          else
-            echo "::error::Formula/$TOOL.rb pins ${pinned:-nothing}, not $VERSION (bump run $concluded: https://github.com/$TAP_REPO/actions/runs/${{ steps.dispatch.outputs.run_id }})"
-            exit 1
-          fi
+      - name: Bump the tap and pin the formula
+        run: bash scripts/bump-tap.sh --repo xminihub/homebrew-tap --tool upland --version "${{ needs.release.outputs.version }}"
 
   cargo:
     name: Publish crate
     needs: [release, tap]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -419,25 +255,20 @@ jobs:
 
       # One build feeds every channel (ADR-0001), and the cargo channel is
       # no exception: the same web-dist artifact the darwin, Linux and
-      # Windows binaries embed is staged here before packaging, so the crate
-      # never ships the UI-less tree build.rs would otherwise create.
+      # Windows binaries embed is staged here before packaging.
       - uses: actions/download-artifact@v4
         with:
           name: web-dist
           path: web/dist
 
-      # verify asserted this listing before the bump; it is asserted again
-      # here because republishing assets is legal and republishing a registry
-      # version is not — a half-packed crate is the one mistake this
-      # pipeline could not undo (ADR-0006). Same script, one derivation.
+      # Asserted again before publishing because republishing assets is legal
+      # and republishing a registry version is not (ADR-0006).
       - name: Assert the crate packaging
         run: bash scripts/assert-crate-packaging.sh
 
-      # The publish itself is the script CI's packaging job dry-runs, so the
-      # command that can burn a one-shot registry version is one derivation,
-      # already proven green before any tag exists.
+      # The publish itself is the script CI's packaging job dry-runs, and an
+      # already-published version skips rather than fails (ADR-0006).
       - name: Publish to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: bash scripts/publish-crate.sh "${{ needs.release.outputs.version }}"
-

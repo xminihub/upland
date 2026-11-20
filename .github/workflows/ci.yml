@@ -61,6 +61,13 @@ jobs:
     needs: [ web, rust ]
     steps:
       - uses: actions/checkout@v4
+
+      # The scripts are the release pipeline's logic, and before release day
+      # the most CI can say about them is that they parse: a refactored shell
+      # that cannot even be read is caught here, not mid-release.
+      - name: Parse-check every script
+        run: for f in scripts/*.sh; do bash -n "$f"; done
+
       - uses: dtolnay/rust-toolchain@stable
       # The merge consumes the Web lane's SPA bundle: it can only assert what
       # the packer will really carry over a staged web/dist, and staging it
